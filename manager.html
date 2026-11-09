@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LagomChat</title>
+<style>
+  :root { --bg: #15161c; --panel: #1d1f27; --line: #2c2f3a; --fg: #e3e4ea; --dim: #8b8fa0; --accent: #6c8cff; --ok: #3fb67a; --bad: #e5403a; }
+  @media (prefers-color-scheme: light) { :root { --bg: #f4f5f8; --panel: #fff; --line: #dcdfe7; --fg: #1d1f27; --dim: #6a6f80; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 28px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h2 { font-size: 16px; margin: 28px 0 10px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; word-break: break-all; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .chat { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .chat:last-child { border-bottom: 0; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.on { background: var(--ok); }
+  .chat .nm { flex: 1; min-width: 180px; }
+  .chat .nm b { display: block; }
+  .chat .nm a { color: var(--dim); font-size: 13px; text-decoration: none; }
+  .chat .nm a:hover { color: var(--accent); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 14px; color: var(--fg); background: transparent;
+           border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.pri { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  button svg { width: 15px; height: 15px; flex: none; }
+  label { display: block; font-size: 13px; color: var(--dim); margin: 12px 0 4px; }
+  input, textarea, select { width: 100%; font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  textarea { min-height: 64px; resize: vertical; font-size: 13px; }
+  input[type=checkbox] { width: auto; margin-right: 6px; }
+  .chk { display: flex; align-items: center; color: var(--fg); font-size: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 3px; }
+  details { border-top: 1px solid var(--line); padding: 10px 0; }
+  details > summary { cursor: pointer; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; }
+  details > summary::before { content: ""; width: 8px; height: 8px; border-right: 2px solid var(--dim); border-bottom: 2px solid var(--dim); transform: rotate(-45deg); transition: transform .15s; }
+  details[open] > summary::before { transform: rotate(45deg); }
+  .msg { margin-top: 12px; font-size: 14px; min-height: 1em; }
+  .msg.err { color: var(--bad); }
+  .msg.ok { color: var(--ok); }
+  .seg { display: flex; gap: 8px; margin-top: 4px; }
+  .seg label { flex: 1; margin: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; cursor: pointer; color: var(--fg); }
+  .seg label:has(input:checked) { border-color: var(--accent); }
+  .seg input { width: auto; margin: 0 6px 0 0; }
+  .seg small { display: block; color: var(--dim); font-size: 12px; margin-top: 2px; }
+  [hidden] { display: none !important; }
+  .bar { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; border-top: 1px solid var(--line); margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>LagomChat</h1>
+  <div class="sub" id="where"></div>
+
+  <!-- the wizard: no chat runs -->
+  <section id="wizard" hidden>
+    <div class="card">
+      <h2 style="margin-top:0">The first chat</h2>
+      <label for="wEmail">Your email (the chat's owner)</label>
+      <input id="wEmail" type="email" autocomplete="email" placeholder="you@example.com">
+      <label for="wTitle">Chat name</label>
+      <input id="wTitle" placeholder="My chat">
+      <label>Where</label>
+      <div class="seg">
+        <label><input type="radio" name="wWhere" value="local" checked>This computer only<small>http://127.0.0.1:&lt;port&gt;, no sign-in, nothing else needed</small></label>
+        <label><input type="radio" name="wWhere" value="domain">On my domain<small>https://&lt;name&gt;.&lt;domain&gt; through Cloudflare, sign-in by email</small></label>
+      </div>
+      <div id="wDomain" hidden>
+        <div class="grid">
+          <div><label for="wDom">Domain (a zone in your Cloudflare account)</label><input id="wDom" placeholder="example.com"></div>
+          <div><label for="wSlug">Subdomain</label><input id="wSlug" placeholder="chat"></div>
+        </div>
+        <label for="wTok">Cloudflare API token</label>
+        <input id="wTok" type="password" autocomplete="off">
+        <div class="hint">Permissions: Account - Access: Apps and Policies Edit, Cloudflare Tunnel Edit; Zone - DNS Edit. Then fill the account and the tunnel under Settings - Cloudflare.</div>
+      </div>
+      <div class="row" style="margin-top:16px"><button class="pri" id="wGo" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Create and start</button></div>
+      <div class="msg" id="wMsg"></div>
+    </div>
+  </section>
+
+  <!-- the chats -->
+  <section id="dash" hidden>
+    <div class="row" style="justify-content:space-between"><h2 style="margin:0">Chats</h2>
+      <button type="button" id="newBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New chat</button></div>
+    <div class="card" style="padding:0;margin-top:10px" id="list"></div>
+    <div class="card" id="newCard" style="margin-top:12px" hidden>
+      <div class="grid">
+        <div><label for="nTitle">Chat name</label><input id="nTitle" placeholder="Book club"></div>
+        <div><label for="nSlug">Subdomain (optional)</label><input id="nSlug" placeholder="made from the name"></div>
+      </div>
+      <label>Where</label>
+      <div class="seg">
+        <label><input type="radio" name="nWhere" value="local" checked>This computer only<small>http://127.0.0.1:&lt;port&gt;</small></label>
+        <label><input type="radio" name="nWhere" value="domain" id="nDomRadio">On the domain<small id="nDomHint"></small></label>
+      </div>
+      <div class="row" style="margin-top:14px"><button class="pri" id="nGo" type="button">Create and start</button><button type="button" id="nCancel">Cancel</button></div>
+      <div class="msg" id="nMsg"></div>
+    </div>
+    <div class="msg" id="opMsg"></div>
+
+    <h2>Settings</h2>
+    <div class="card" id="settings"></div>
+    <div class="bar row"><button class="pri" id="saveBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>Save</button>
+      <span class="hint">Saved to the config; the chats whose settings changed restart by themselves.</span></div>
+    <div class="msg" id="saveMsg"></div>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const I = {
+  open: '<path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
+  play: '<path d="M7 5l12 7-12 7z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
+  re: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', del: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+};
+const ico = n => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${I[n]}</svg>`;
+let S = null;
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  if (r.status === 403) { document.body.innerHTML = await r.text(); throw new Error('no key'); }
+  const j = await r.json(); if (!j.ok) throw new Error(j.error || 'failed'); return j.result;
+}
+function say(el, t, kind) { const m = $(el); m.textContent = t || ''; m.className = 'msg' + (kind ? ' ' + kind : ''); }
+
+async function load(keepForm) {
+  S = await api('api/state');
+  $('#where').textContent = `${S.platform === 'mac' ? 'Mac' : 'Linux'} · ${S.repo} · ${S.config_file}`;
+  const any = S.chats.length > 0, running = S.chats.some(c => c.running);
+  $('#wizard').hidden = running;                         // no chat runs: the wizard (#2009); the stopped ones are listed under it
+  $('#dash').hidden = !any;
+  if (!running && $('#wEmail').value === '') $('#wEmail').value = S.config.owner_email || '';
+  paintList();
+  if (!keepForm) paintSettings();
+  $('#nDomHint').textContent = S.cloudflare_ready ? `https://<name>.${S.config.domain}` : 'set up Cloudflare in Settings first';
+  $('#nDomRadio').disabled = !S.cloudflare_ready;
+}
+function paintList() {
+  $('#list').innerHTML = S.chats.map(c => `<div class="chat" data-slug="${esc(c.slug)}">
+    <span class="dot${c.running ? ' on' : ''}" title="${c.running ? 'running' : 'stopped'}"></span>
+    <div class="nm"><b>${esc(c.title)}${c.main ? ' <span class="hint">main</span>' : ''}</b><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url.replace(/^https?:\/\//, ''))}</a> <span class="hint">:${c.port}</span></div>
+    <div class="row">
+      ${c.running ? `<a href="${esc(c.url)}" target="_blank" rel="noopener"><button type="button">${ico('open')}Open</button></a>
+        <button type="button" data-op="restart">${ico('re')}Restart</button><button type="button" data-op="stop">${ico('stop')}Stop</button>`
+        : `<button type="button" data-op="start">${ico('play')}Start</button>`}
+      ${c.main ? '' : `<button type="button" class="danger" data-op="delete">${ico('del')}Delete</button>`}
+    </div></div>`).join('') || '<div class="chat hint">No chats yet</div>';
+}
+
+// ---- settings: every key of the config as a field
+const F = (id, label, val, o = {}) => `<div><label for="${id}">${esc(label)}</label>${o.area
+  ? `<textarea id="${id}" data-k="${esc(o.k)}" data-t="${o.t || 'lines'}">${esc(val)}</textarea>`
+  : `<input id="${id}" data-k="${esc(o.k)}" data-t="${o.t || 'str'}" type="${o.type || 'text'}" value="${esc(val)}" autocomplete="off"${o.ph ? ` placeholder="${esc(o.ph)}"` : ''}>`}${o.hint ? `<div class="hint">${esc(o.hint)}</div>` : ''}</div>`;
+const lines = a => (a || []).join('\n');
+function paintSettings() {
+  const c = S.config, cf = c.cloudflare;
+  let h = `<details open><summary>This machine</summary><div class="grid">
+    ${F('g_owner', "Owner's email", c.owner_email, { k: 'owner_email', type: 'email', hint: 'the owner of every chat, unless a chat says otherwise' })}
+    ${F('g_dom', 'Domain for new chats', c.domain, { k: 'domain', ph: 'example.com' })}
+    ${F('g_doms', 'Domains the chats live on', lines(c.domains), { k: 'domains', area: 1, hint: 'one per line' })}
+    ${F('g_moved', 'Moved from (redirect to the domain)', lines(c.moved_from), { k: 'moved_from', area: 1, hint: 'a page opened on <name>.<old> goes to <name>.<domain>' })}
+  </div></details>
+  <details><summary>Cloudflare</summary><div class="grid">
+    ${F('cf_tok', 'API token', cf.token, { k: 'cloudflare.token', type: 'password' })}
+    ${F('cf_acc', 'Account id', cf.account, { k: 'cloudflare.account' })}
+    ${F('cf_tun', 'Tunnel id (cloudflared on this machine)', cf.tunnel, { k: 'cloudflare.tunnel' })}
+    ${F('cf_idp', 'Access login method id (one-time code by email)', cf.idp, { k: 'cloudflare.idp' })}
+    ${F('cf_zones', 'Zones: domain=zone id', Object.entries(cf.zones || {}).map(([d, z]) => `${d}=${z}`).join('\n'), { k: 'cloudflare.zones', area: 1, t: 'map' })}
+  </div></details>`;
+  for (const [slug, ch] of Object.entries(c.chats)) {
+    const p = `c_${slug.replace(/[^a-z0-9]/g, '_')}_`, k = x => `chats.${slug}.${x}`, g = ch.guests || {};
+    h += `<details><summary>${esc(ch.title || slug)} <span class="hint">${esc(slug)}</span></summary><div class="grid">
+      ${F(p + 'title', 'Title', ch.title, { k: k('title') })}
+      ${F(p + 'port', 'Port', ch.port, { k: k('port'), t: 'int', type: 'number' })}
+      ${F(p + 'host', 'Address', ch.host, { k: k('host'), hint: 'set by Cloudflare when the chat was made' })}
+      ${F(p + 'owner', "Owner's email (this chat)", ch.owner_email, { k: k('owner_email'), type: 'email', ph: c.owner_email })}
+      <div><label>&nbsp;</label><label class="chk"><input type="checkbox" data-k="${esc(k('auth'))}" data-t="bool"${ch.auth ? ' checked' : ''}>Sign-in required (Cloudflare Access email)</label></div>
+      ${F(p + 'rn', 'Names that mean the owner', lines(ch.reserved_names), { k: k('reserved_names'), area: 1, hint: 'agents may write --to <name>' })}
+      ${F(p + 'ge', 'Guests: emails', lines(g.google_emails), { k: k('guests.google_emails'), area: 1 })}
+      ${F(p + 'gd', 'Guests: whole email domains', lines(g.google_domains), { k: k('guests.google_domains'), area: 1 })}
+      ${F(p + 'gi', 'Guests: Discord ids', lines(g.discord_ids), { k: k('guests.discord_ids'), area: 1 })}
+      ${F(p + 'gt', 'Giphy API key', ch.giphy_token, { k: k('giphy_token'), type: 'password' })}
+      ${F(p + 'tt', 'Telegram bot token', ch.telegram_token, { k: k('telegram_token'), type: 'password' })}
+      ${F(p + 'sr', 'Score rival', ch.score_rival, { k: k('score_rival') })}
+      ${F(p + 'st', "Owner's Steam id", ch.owner_steam, { k: k('owner_steam') })}
+      ${F(p + 'aud', 'Cloudflare Access AUD', ch.cf_aud, { k: k('cf_aud') })}
+      ${F(p + 'em', 'Embeddings service URL', ch.embed_url, { k: k('embed_url'), ph: 'none: search by words only' })}
+      ${F(p + 'ld', 'Left the chat after (s, a return before that writes nothing)', ch.leave_delay, { k: k('leave_delay'), t: 'num', type: 'number' })}
+      ${F(p + 'pq', 'People quiet (s)', ch.people_quiet, { k: k('people_quiet'), t: 'num', type: 'number' })}
+      ${F(p + 'ih', 'Away hidden after (s)', ch.idle_hide, { k: k('idle_hide'), t: 'num', type: 'number' })}
+      ${F(p + 'at', 'Agents in a row before a pause (0: never)', ch.agent_turns ?? 10, { k: k('agent_turns'), t: 'num', type: 'number' })}
+      ${F(p + 'py', 'Python', ch.python || '', { k: k('python'), ph: 'the manager\'s own' })}
+    </div><div class="hint">conf ${esc(ch.conf)} · data ${esc(ch.data)}</div></details>`;
+  }
+  $('#settings').innerHTML = h;
+}
+function collect() {
+  const c = JSON.parse(JSON.stringify(S.config));
+  for (const el of document.querySelectorAll('#settings [data-k]')) {
+    const path = el.dataset.k.split('.'), t = el.dataset.t; let v;
+    if (t === 'bool') v = el.checked;
+    else if (t === 'int' || t === 'num') { v = Number(el.value); if (!isFinite(v)) throw new Error(`${el.dataset.k}: a number`); if (t === 'int') v = Math.round(v); }
+    else if (t === 'lines') v = el.value.split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
+    else if (t === 'map') v = Object.fromEntries(el.value.split('\n').map(x => x.split('=').map(y => y.trim())).filter(x => x[0] && x[1]));
+    else v = el.value.trim();
+    // a chat's slug may hold a dot-free name only, so the path is safe to walk
+    let o = c; for (const p of path.slice(0, -1)) o = o[p] = o[p] ?? {}; o[path.at(-1)] = v;
+  }
+  return c;
+}
+
+// ---- actions
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-op]'); if (!b) return;
+  const slug = b.closest('[data-slug]').dataset.slug, op = b.dataset.op;
+  if (op === 'delete' && !confirm(`Delete the chat ${slug}? It stops; its history and settings are moved to ~/.local/share/agentchat-deleted (not erased).`)) return;
+  document.querySelectorAll('[data-op]').forEach(x => x.disabled = true); say('#opMsg', `${op} ${slug}...`);
+  try { await api('api/op', { op, slug }); say('#opMsg', ''); } catch (x) { say('#opMsg', x.message, 'err'); }
+  await load(true);
+});
+$('#saveBtn').onclick = async () => {
+  let c; try { c = collect(); } catch (x) { say('#saveMsg', x.message, 'err'); return; }
+  $('#saveBtn').disabled = true; say('#saveMsg', 'Saving...');
+  try { const r = await api('api/save', { config: c }); say('#saveMsg', r.restarted.length ? `Saved; restarted: ${r.restarted.join(', ')}` : 'Saved; nothing to restart', 'ok'); await load(); }
+  catch (x) { say('#saveMsg', x.message, 'err'); }
+  $('#saveBtn').disabled = false;
+};
+$('#newBtn').onclick = () => { $('#newCard').hidden = !$('#newCard').hidden; $('#nTitle').focus(); };
+$('#nCancel').onclick = () => { $('#newCard').hidden = true; };
+$('#nGo').onclick = async () => {
+  $('#nGo').disabled = true; say('#nMsg', 'Creating...');
+  try {
+    const r = await api('api/new', { title: $('#nTitle').value, slug: $('#nSlug').value, where: document.querySelector('[name=nWhere]:checked').value });
+    say('#nMsg', `Ready: ${r.url}`, 'ok'); $('#nTitle').value = $('#nSlug').value = ''; await load();
+  } catch (x) { say('#nMsg', x.message, 'err'); }
+  $('#nGo').disabled = false;
+};
+for (const r of document.querySelectorAll('[name=wWhere]')) r.onchange = () => { $('#wDomain').hidden = document.querySelector('[name=wWhere]:checked').value !== 'domain'; };
+$('#wGo').onclick = async () => {
+  const where = document.querySelector('[name=wWhere]:checked').value, email = $('#wEmail').value.trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { say('#wMsg', 'Your email, please', 'err'); return; }
+  $('#wGo').disabled = true; say('#wMsg', 'Creating...');
+  try {
+    if (where === 'domain') {
+      const c = JSON.parse(JSON.stringify(S.config));
+      c.owner_email = email; c.domain = $('#wDom').value.trim().toLowerCase(); c.domains = [...new Set([c.domain, ...c.domains])];
+      c.cloudflare.token = $('#wTok').value.trim();
+      await api('api/save', { config: c });
+    }
+    const r = await api('api/new', { owner_email: email, title: $('#wTitle').value || 'Chat', slug: $('#wSlug').value, where });
+    say('#wMsg', `Ready: ${r.url}`, 'ok'); if (window.__acApp) { location.href = r.url; return; } window.open(r.url, '_blank'); await load();
+  } catch (x) { say('#wMsg', x.message, 'err'); }
+  $('#wGo').disabled = false;
+};
+// in the LagomChat app (#2011) a chat opens in the same window; the menu's Chats and Server brings this page back
+document.addEventListener('click', e => {
+  const a = e.target.closest('a[target=_blank]');
+  if (a && window.__acApp) { e.preventDefault(); location.href = a.href; }
+});
+load().catch(x => { if (x.message !== 'no key') document.body.textContent = x.message; });
+setInterval(() => { if (!document.hidden) api('api/state').then(s => { S.chats = s.chats; paintList(); }).catch(() => {}); }, 5000);
+</script>
+</body>
+</html>

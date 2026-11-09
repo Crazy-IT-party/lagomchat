@@ -1,0 +1,11 @@
+LagomChat
+Copyright 2026 Lagom (lagom.game, info@lagom.game)
+
+This product is made by the Lagom studio (https://lagom.game).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+Anyone who distributes this software or a work based on it must keep this
+NOTICE file (Apache License 2.0, section 4(d)).
+
+Third-party code shipped here keeps its own licence:
+- vendor/highlight.min.js: highlight.js, BSD 3-Clause (its licence beside it)

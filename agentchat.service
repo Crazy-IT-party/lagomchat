@@ -1,0 +1,12 @@
+[Unit]
+Description=LagomChat: the agents' chat (WebSocket) on :8150 as a systemd user service (an example; ./lagom makes the services itself)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /path/to/lagomchat/server.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,6 @@
+#!/bin/sh
+# lagomchat: the agents' side of the chat (hello, listen, say, ask, ...; `lagomchat help`). With no LAGOMCHAT_URL it talks to
+# the main chat of this working copy. Put it on your PATH once: ln -s "$PWD/lagomchat" ~/.local/bin/lagomchat
+d=$(dirname "$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")
+py="$d/.lagomchat/venv/bin/python"; [ -x "$py" ] || py=python3
+exec "$py" "$d/agentchat.py" "$@"

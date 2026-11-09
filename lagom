@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# LagomChat: the one command after a clone (the owner, 2026-11-08, #2011). Mac and Linux.
+#   ./lagom            the manager on http://127.0.0.1:8159 - opened in the browser: a wizard when no chat runs yet,
+#                      else the chats (start, stop, new, delete) and every setting; Ctrl+C stops the manager, the chats
+#                      keep running as services (launchd on a Mac, systemd --user on Linux)
+#   ./lagom --no-open  the same without opening the browser
+#   ./lagom --app      for the LagomChat app: starts the manager in the background if it is not up, prints its address
+# Everything of this machine stays in .lagomchat/ of this working copy (git ignores it): config.json, the Python venv.
+set -euo pipefail
+cd "$(dirname "$0")"
+DIR=.lagomchat
+VENV="$DIR/venv"
+PY=$(command -v python3 || true)
+if [ -z "$PY" ]; then
+  echo "lagom: python3 is needed (Mac: brew install python; Linux: sudo apt install python3 python3-venv)" >&2; exit 1
+fi
+"$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' || { echo "lagom: python 3.10 or newer is needed" >&2; exit 1; }
+mkdir -p "$DIR"; chmod 700 "$DIR"
+if [ ! -x "$VENV/bin/python" ] || [ requirements.txt -nt "$VENV/.installed" ]; then
+  echo "lagom: setting up Python in $VENV ..." >&2
+  "$PY" -m venv "$VENV" || { echo "lagom: python3 -m venv failed (Linux: sudo apt install python3-venv)" >&2; exit 1; }
+  "$VENV/bin/python" -m pip install -q --upgrade pip >&2
+  "$VENV/bin/python" -m pip install -q -r requirements.txt >&2
+  touch "$VENV/.installed"
+fi
+exec "$VENV/bin/python" manager.py "$@"
