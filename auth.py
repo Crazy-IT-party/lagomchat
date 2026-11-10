@@ -182,7 +182,18 @@ def _cfg_team() -> str:
         return ""
 
 
+def _cfg_old_teams() -> list[str]:
+    """the team's former addresses (`cloudflare.old_teams`): Access renamed, the tokens signed before still name the old one"""
+    try:
+        from pathlib import Path
+        home = Path(os.environ.get("LAGOMCHAT_HOME") or Path(__file__).resolve().parent / ".lagomchat")
+        return [str(x).rstrip("/") for x in (json.loads((home / "config.json").read_text()).get("cloudflare") or {}).get("old_teams") or [] if x]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 CF_TEAM = (os.environ.get("LAGOMCHAT_CF_TEAM") or _cfg_team()).rstrip("/")
+CF_ISSUERS = [CF_TEAM] + [t for t in _cfg_old_teams() if t != CF_TEAM]   # the same account's keys sign them all
 CF_AUD = os.environ.get("LAGOMCHAT_CF_AUD", "")
 _JWKS = None
 
@@ -197,7 +208,7 @@ def cf_access_email(token: str | None) -> str | None:
         if _JWKS is None:
             _JWKS = jwt.PyJWKClient(CF_TEAM + "/cdn-cgi/access/certs", cache_keys=True, lifespan=3600)
         key = _JWKS.get_signing_key_from_jwt(token).key
-        body = jwt.decode(token, key, algorithms=["RS256"], audience=CF_AUD, issuer=CF_TEAM, options={"require": ["exp", "aud", "iss"]})
+        body = jwt.decode(token, key, algorithms=["RS256"], audience=CF_AUD, issuer=CF_ISSUERS, options={"require": ["exp", "aud", "iss"]})
         em = str(body.get("email") or "").strip().lower()
         return em if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", em) else None
     except Exception as x:                               # a bad signature, another app's, expired, the keys unreachable

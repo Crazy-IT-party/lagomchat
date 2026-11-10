@@ -139,11 +139,13 @@ fn page_window(
     min: (f64, f64),
 ) -> tauri::Result<()> {
     let mut builder = WebviewWindowBuilder::new(app, label, url);
+    // the app's version for the page's About (the owner, #2484, #2494)
+    let ver = format!("window.__acAppVer = {:?};", app.package_info().version.to_string());
     // the main window's title follows the page's: the chat's own name; the settings window stays "Settings"
     if label == "main" {
         builder = builder
             // the page knows it is in the app by this mark (the badge is drawn only here); the start page and the settings window have no use for it
-            .initialization_script("window.__acApp = 1;")
+            .initialization_script(format!("window.__acApp = 1; {ver}"))
             .on_document_title_changed(|window, title| {
                 let (title, notice) = split_notify(&title);
                 if let Some((t, b)) = notice {
@@ -164,7 +166,7 @@ fn page_window(
     let unsaved = Arc::new(AtomicBool::new(false));
     if label == "settings" {
         let flag = unsaved.clone();
-        builder = builder.initialization_script("window.__acAppSet = 1;").on_document_title_changed(move |window, title| {
+        builder = builder.initialization_script(format!("window.__acAppSet = 1; {ver}")).on_document_title_changed(move |window, title| {
             flag.store(title.ends_with(" [dirty]"), Ordering::SeqCst);
             if title.ends_with(" [close]") {
                 let _ = window.close();
@@ -235,8 +237,8 @@ fn change_address(app: &AppHandle) -> tauri::Result<()> {
 
 // the people thanked in the About window (the owner, #2365, #2369): the Mac shows them as its credits, Linux as the authors
 const CREDITS: &[&str] = &[
-    "martyshka", "Luca", "Dominic", "Patrick", "ovtza", "moon", "ienrf", "HACTEHA", "pio", "Fedor", "mama", "Masha",
-    "Natasha", "Tsoi", "Gorshok", "Eugene", "Jim", "Alexander", "Adam", "pupsique", "Zello", "Thomas",
+    "martyshka", "Luca", "Dominic", "Patrick", "ovtza", "penis lena", "moon", "ienrf", "HACTEHA", "pio", "Fedor", "mama", "Masha",
+    "Natasha", "Tsoi", "Gorshok", "Eugene", "Jim", "Alexander", "Adam", "pupsique", "Zello", "Thomas", "Sina", "Scooby",
 ];
 
 fn about() -> AboutMetadata<'static> {

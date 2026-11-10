@@ -34,6 +34,7 @@ import base64
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -45,7 +46,8 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
+from aiohttp.resolver import ThreadedResolver
 
 # the environment's names are LAGOMCHAT_*; the older AGENTCHAT_* ones still work (the owner #2302)
 for _k, _v in list(os.environ.items()):
@@ -1193,6 +1195,8 @@ class Chat:
                 out[key]["langs"].append(v["lang"])
             if v.get("tz") and not out[key].get("tz"):
                 out[key]["tz"] = v["tz"]
+            if isinstance(v.get("rtt"), int) and (out[key].get("rtt") is None or v["rtt"] < out[key]["rtt"]):
+                out[key]["rtt"] = v["rtt"]               # the round trip of the person's best tab, ms (the owner, #2489)
             if with_ids:
                 u = out[key]
                 u["tabs"] += 1
@@ -1528,7 +1532,7 @@ async def op(q: dict, ws) -> dict:
         # the chat's name on the page: superman's to change (the owner, #1078); no text - say what it is now
         # its translations (#1723): {"en": .., "ru": .., "cs": .., "de": ..}; a new name drops the old ones, --tr alone adds to them
         t = " ".join(text.split())[:60]
-        tr = {k: " ".join(str(v).split())[:60] for k, v in (q.get("tr") or {}).items() if k in ("en", "ru", "uk", "be", "cs", "de", "es", "sv") and str(v).strip()}
+        tr = {k: " ".join(str(v).split())[:60] for k, v in (q.get("tr") or {}).items() if k in ("en", "ru", "uk", "be", "cs", "de", "es", "sv", "fr", "it", "pl", "pt", "zh") and str(v).strip()}
         if not t and not tr:
             return {"ok": True, "title": chat.title, "tr": chat.title_tr}
         if a["name"].lower() not in DEPUTY:
@@ -2214,6 +2218,168 @@ async def api_display_name(req: web.Request) -> web.Response:
 
 
 _PR_CACHE: dict[str, tuple[float, dict]] = {}
+_X_CACHE: dict[str, tuple[float, dict]] = {}
+_OG_CACHE: dict[str, tuple[float, dict]] = {}
+OG_UA = "Mozilla/5.0 (compatible; LagomChat link preview)"
+
+
+async def _og_public(host: str) -> bool:
+    """a link's host may be fetched only when every address it has is out on the internet: never this machine, its LAN, its tunnels"""
+    import ipaddress
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    ips = {i[4][0].split("%")[0] for i in infos}
+    return bool(ips) and all(_og_ip_ok(a) for a in ips)
+
+
+def _og_ip_ok(a: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(a)
+    except ValueError:
+        return False
+    return ip.is_global and not (ip.version == 6 and ip in ipaddress.ip_network("64:ff9b::/96"))   # NAT64 reaches IPv4 inside
+
+
+class _OgResolver(ThreadedResolver):
+    """the addresses a link's fetch connects to are checked themselves (the audit before 0.2.0): a name that answered a public
+    address to the check and this machine or the LAN to the connection (DNS rebinding) gets nothing"""
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        res = await super().resolve(host, port, family)
+        if not res or not all(_og_ip_ok(r["host"]) for r in res):
+            raise OSError(f"not a public address: {host}")
+        return res
+
+
+_OG_SEM = asyncio.Semaphore(4)       # at most four fetches for cards at once, the chats' machine is no one's fetcher
+
+
+async def _og_get(url: str, limit: int = 600_000) -> tuple[str, str] | None:
+    """(final address, text) of a public page, redirects followed by hand so each hop is checked; None when it cannot be had"""
+    from urllib.parse import urljoin, urlsplit
+    async with _OG_SEM, ClientSession(timeout=ClientTimeout(total=10), connector=TCPConnector(resolver=_OgResolver(), use_dns_cache=False),
+                                      headers={"User-Agent": OG_UA, "Accept-Language": "en,ru;q=0.8"}) as s:
+        for _ in range(5):
+            u = urlsplit(url)
+            if u.scheme not in ("http", "https") or not u.hostname or not await _og_public(u.hostname):
+                return None
+            async with s.get(url, allow_redirects=False) as r:
+                if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                    url = urljoin(url, r.headers["Location"]); continue
+                if r.status != 200:
+                    return None
+                ct = r.headers.get("Content-Type", "")
+                if "html" not in ct and "json" not in ct:
+                    return None
+                buf = bytearray()
+                async for chunk in r.content.iter_chunked(65536):
+                    buf += chunk
+                    if len(buf) > limit:
+                        break
+                try:
+                    return url, bytes(buf).decode(r.charset or "utf-8", "replace")
+                except LookupError:                                  # a charset Python does not know
+                    return url, bytes(buf).decode("utf-8", "replace")
+    return None
+
+
+def _og_parse(page: str, base: str) -> dict:
+    """the card's words and picture from a page's own tags: og:, twitter:, then <title> and the description"""
+    import html as _h
+    from urllib.parse import urljoin
+    meta = {}
+    page = page[:200_000]                # bounded patterns on a bounded page: a page made to stall a regex cannot (the audit)
+    for tag in re.findall(r"<meta\b[^<>]{0,2000}>", page, re.I):
+        k = re.search(r"""(?:property|name)\s*=\s*["']([^"']+)["']""", tag, re.I)
+        v = re.search(r"""content\s*=\s*["']([^"']*)["']""", tag, re.I) or re.search(r"""content\s*=\s*([^\s>]+)""", tag, re.I)
+        if k and v:
+            meta.setdefault(k.group(1).lower(), _h.unescape(v.group(1)).strip())
+    t = re.search(r"<title[^<>]{0,200}>([^<]{0,500})</title>", page, re.I)
+    pick = lambda *ks: next((meta[k] for k in ks if meta.get(k)), "")
+    img = pick("og:image", "og:image:url", "twitter:image", "twitter:image:src")
+    return {"title": (pick("og:title", "twitter:title") or (_h.unescape(t.group(1)).strip() if t else ""))[:200],
+            "desc": pick("og:description", "twitter:description", "description")[:400],
+            "image": urljoin(base, img)[:1000] if img and not img.startswith("data:") else "",
+            "site": pick("og:site_name")[:80]}
+
+
+async def api_og(req: web.Request) -> web.Response:
+    """a link's preview card (the owner, #2473): the page's own title, words and picture, fetched by the chat's machine for the
+    signed-in ones; TikTok and Reddit through their oEmbed (their pages say nothing to a fetch); kept 6 hours"""
+    await need_viewer(req)
+    url = req.query.get("u", "")
+    if not re.fullmatch(r"https?://[^\s]{4,2000}", url):
+        return web.json_response({"ok": False, "error": "bad_request"})
+    hit = _OG_CACHE.get(url)
+    if hit and time.time() - hit[0] < (21600 if hit[1].get("ok") else 1800):
+        return web.json_response(hit[1])
+    out: dict = {"ok": False}
+    try:
+        from urllib.parse import quote
+        host = (re.match(r"https?://([^/:?#]+)", url) or [None, ""])[1].lower()
+        oe = ("https://www.tiktok.com/oembed?url=" if host.endswith("tiktok.com") else
+              "https://www.reddit.com/oembed?url=" if host.endswith("reddit.com") or host == "redd.it" else "")
+        if oe:
+            got = await _og_get(oe + quote(url, safe=""))
+            if got:
+                d = json.loads(got[1])
+                h = str(d.get("html") or "")
+                a = re.search(r"<a [^>]*>([^<]{2,300})</a>", h)
+                out = {"ok": True, "title": str(d.get("title") or (a.group(1) if a else ""))[:200], "desc": str(d.get("author_name") or "")[:120],
+                       "image": str(d.get("thumbnail_url") or "")[:1000], "site": str(d.get("provider_name") or "")[:80]}
+        else:
+            got = await _og_get(url)
+            if got:
+                c = await asyncio.get_running_loop().run_in_executor(None, _og_parse, got[1], got[0])
+                if c["title"] or c["desc"] or c["image"]:
+                    out = {"ok": True, **c}
+    except (ClientError, asyncio.TimeoutError, OSError, ValueError, LookupError, AttributeError, TypeError) as x:
+        print(f"[og] {type(x).__name__}", flush=True)
+    if len(_OG_CACHE) > 3000:
+        _OG_CACHE.clear()
+    _OG_CACHE[url] = (time.time(), out)
+    return web.json_response(out)
+
+
+def _x_text(h: str) -> str:
+    """the post's own words out of X's oEmbed html: lines kept, tags and entities gone; nothing of their markup reaches the page"""
+    import html as _h
+    m = re.search(r"<p[^>]*>(.*?)</p>", h, re.S)
+    t = re.sub(r"<br\s*/?>", "\n", m.group(1) if m else "")
+    return _h.unescape(re.sub(r"<[^>]+>", "", t)).strip()[:2000]
+
+
+async def api_x(req: web.Request) -> web.Response:
+    """an X / Twitter post named in a message (the owner, #2453, #2455): its author, words and date from X's oEmbed, shown
+    in the log at once with nothing loaded from X by the page; kept a day"""
+    await need_viewer(req)
+    pid = req.query.get("id", "")
+    if not re.fullmatch(r"\d{5,25}", pid):
+        return web.json_response({"ok": False, "error": "bad_request"})
+    hit = _X_CACHE.get(pid)
+    if hit and time.time() - hit[0] < (86400 if hit[1].get("ok") else 600):
+        return web.json_response(hit[1])
+    url = f"https://publish.twitter.com/oembed?url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F{pid}&omit_script=1&dnt=true"
+    out: dict = {"ok": False, "error": "unavailable"}
+    try:
+        async with _OG_SEM, ClientSession(timeout=ClientTimeout(total=10)) as s, s.get(url) as r:
+            if r.status == 200:
+                d = await r.json(content_type=None)
+                h = str(d.get("html") or "")
+                date = re.findall(r"<a [^>]*>([^<]{4,40})</a>\s*</blockquote>", h)
+                out = {"ok": True, "author": str(d.get("author_name") or "")[:80],
+                       "handle": "@" + str(d.get("author_url") or "").rstrip("/").rsplit("/", 1)[-1][:20],
+                       "text": _x_text(h), "date": date[0] if date else "", "url": f"https://x.com/i/status/{pid}"}
+            else:
+                print(f"[x] oEmbed answered {r.status} for {pid}", flush=True)
+    except (ClientError, asyncio.TimeoutError, OSError, ValueError, AttributeError, TypeError) as x:
+        print(f"[x] oEmbed: {type(x).__name__}", flush=True)
+    if len(_X_CACHE) > 3000:
+        _X_CACHE.clear()
+    _X_CACHE[pid] = (time.time(), out)
+    return web.json_response(out)
 
 
 async def api_pr(req: web.Request) -> web.Response:
@@ -2602,8 +2768,8 @@ async def push_static(req: web.Request) -> web.StreamResponse:
 async def manifest(req: web.Request) -> web.Response:
     return web.json_response({"name": chat.title, "short_name": chat.title[:20], "start_url": "./", "scope": "./", "display": "standalone",
                               "background_color": "#1e1f22", "theme_color": "#1e1f22",
-                              "icons": [{"src": "appicon-192.png", "sizes": "192x192", "type": "image/png"},
-                                        {"src": "appicon-512.png", "sizes": "512x512", "type": "image/png"}]},
+                              "icons": [{"src": "appicon-192.png?v=ring", "sizes": "192x192", "type": "image/png"},
+                                        {"src": "appicon-512.png?v=ring", "sizes": "512x512", "type": "image/png"}]},
                              content_type="application/manifest+json")
 
 
@@ -2906,7 +3072,7 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                email=me.get("em") or "")
     me["via"] = "cf" if req.headers.get("Cf-Ray") else "direct"
     lang = req.query.get("lang") or ""                   # the language picked on this page (the owner, #2132)
-    me["lang"] = lang if lang in ("en", "ru", "uk", "be", "cs", "de", "es", "sv") else ""
+    me["lang"] = lang if lang in ("en", "ru", "uk", "be", "cs", "de", "es", "sv", "fr", "it", "pl", "pt", "zh") else ""
     tz = req.query.get("tz") or ""                       # the page's time zone (IANA name), shown only if the person turns it on (#2222)
     me["tz"] = tz if re.fullmatch(r"[A-Za-z]+(?:/[A-Za-z0-9_+\-]+){0,2}|UTC", tz) else ""
     # Cloudflare's own lookup, no outside service gets the address; XX = unknown, T1 = Tor (two letters that name no country)
@@ -2973,6 +3139,21 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                         (st.add if q[f] else st.discard)(k)
                         fl.write_text(json.dumps(sorted(st), ensure_ascii=False))
                 await chat.send_presence()
+                continue
+            if "ping" in q and len(q) == 1:                       # the page measures its round trip to this server (the owner, #2489)
+                t = q["ping"]
+                await send(ws, json.dumps({"type": "pong", "t": t if isinstance(t, (int, float)) and math.isfinite(t) else 0}))
+                continue
+            if "rtt" in q and len(q) == 1:                        # ... and says what it got: shown on its person's card
+                try:
+                    rtt = max(0, min(60000, int(q["rtt"])))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                # everyone's cards are sent again only when it changed, and at most every 10 s for a tab (the audit before 0.2.0)
+                was, me["rtt"] = me.get("rtt"), rtt
+                if rtt != was and time.time() - me.get("rtt_at", 0) >= 10:
+                    me["rtt_at"] = time.time()
+                    await chat.send_presence()
                 continue
             if q.get("pushvis") is not None:                     # this page's push endpoint and whether it is looked at: no push to it then (#1445)
                 me["pushep"], me["vis"] = str(q.get("pushvis") or "")[:600], bool(q.get("v"))
@@ -3878,6 +4059,31 @@ def built_at() -> float:
         return STARTED
 
 
+def app_version() -> dict:
+    """the version for the settings' About (the owner, #2484): the release's number (the app's tauri.conf.json, what the
+    GitHub releases are tagged with) and the commit this working copy is on"""
+    v, rev = "", ""
+    try:
+        v = json.loads((HERE / "desktop" / "src-tauri" / "tauri.conf.json").read_text()).get("version", "")
+    except (OSError, ValueError):
+        pass
+    try:
+        head = (HERE / ".git" / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            f = HERE / ".git" / head[5:]
+            if f.exists():
+                head = f.read_text().strip()
+            else:
+                for line in (HERE / ".git" / "packed-refs").read_text().splitlines():
+                    if line.endswith(" " + head[5:]):
+                        head = line.split()[0]
+                        break
+        rev = head[:7] if len(head) >= 7 and all(c in "0123456789abcdef" for c in head[:40]) else ""
+    except OSError:
+        pass
+    return {"v": v, "rev": rev}
+
+
 def page_version() -> str:
     """the page's version, "css:<hash>|rest:<hash>": an open page whose styles alone are older takes the new ones in place,
     any other change reloads it keeping the draft, the scroll and the search (the owner, 2026-11-02, #1169)"""
@@ -4043,7 +4249,7 @@ async def page(_req):
     body = (HERE / "index.html").read_text().replace(f"<title>{DEFAULT_TITLE}</title>", f"<title>{t}</title>", 1) \
         .replace(f"<h1>{DEFAULT_TITLE}</h1>", f"<h1>{t}</h1>", 1)
     # the chats' domains from the settings (#1981), before the page's own scripts read them
-    body = body.replace("<head>", "<head><script>window.AC_DOMAINS=" + json.dumps(settings()).replace("<", "\\u003c") + f";window.AC_BUILT={built_at():.0f};window.AC_PORT={PORT}</script>", 1)
+    body = body.replace("<head>", "<head><script>window.AC_DOMAINS=" + json.dumps(settings()).replace("<", "\\u003c") + f";window.AC_BUILT={built_at():.0f};window.AC_PORT={PORT};window.AC_VER=" + json.dumps(app_version()) + "</script>", 1)
     # highlight.js inside the page (the owner, #564): a request of its own for the file may not get through a proxy's sign-in
     try:
         hl = (HERE / "vendor" / "highlight.min.js").read_text()
@@ -4051,7 +4257,14 @@ async def page(_req):
         body = f"{head}<script>{hl}</script></body>{tail}"
     except (OSError, ValueError):
         pass                                              # no library or no </body>: plain code blocks
-    return web.Response(text=body, content_type="text/html", headers={"Cache-Control": "no-cache"})
+    # going between chats (the owner, #2440): the page is ~1 MB; the browser keeps it and asks with its tag, the same page is a
+    # 304 with no body, a new one comes compressed
+    tag = '"' + hashlib.sha1(body.encode()).hexdigest()[:20] + '"'
+    if tag.strip('"') in [x.strip().removeprefix("W/").strip('"') for x in _req.headers.get("If-None-Match", "").split(",")]:
+        return web.Response(status=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+    r = web.Response(text=body, content_type="text/html", headers={"Cache-Control": "no-cache", "ETag": tag})
+    r.enable_compression()
+    return r
 
 
 async def log_txt(req):
@@ -4511,8 +4724,37 @@ async def on_stop(app):
     await asyncio.gather(*(bye(w) for w in socks))
 
 
+class _Stamped:
+    """stdout/stderr of the server with the local date and time in front of every line: an audit of who came when needs it
+    (the owner #20, chat Myself)."""
+
+    def __init__(self, out):
+        self.out, self.bol = out, True
+
+    def write(self, s):
+        if not s:
+            return 0
+        parts = s.split("\n")
+        buf = []
+        for i, p in enumerate(parts):
+            if p and self.bol:
+                buf.append(time.strftime("%Y-%m-%d %H:%M:%S "))
+            buf.append(p)
+            if i < len(parts) - 1:
+                buf.append("\n")
+                self.bol = True
+            elif p:
+                self.bol = False
+        self.out.write("".join(buf))
+        return len(s)
+
+    def __getattr__(self, name):
+        return getattr(self.out, name)
+
+
 def main():
     global chat
+    sys.stdout, sys.stderr = _Stamped(sys.stdout), _Stamped(sys.stderr)
     chat = Chat()
     app = web.Application(client_max_size=55 * 2 ** 20)          # a video up to 50 MB (#1426)
     if UPLOADS.is_dir():                              # two weeks, then gone
@@ -4544,6 +4786,8 @@ def main():
     app.router.add_get("/api/skills", api_skills)
     app.router.add_get("/api/search", api_search)
     app.router.add_get("/api/pr", api_pr)
+    app.router.add_get("/api/x", api_x)
+    app.router.add_get("/api/og", api_og)
     app.router.add_get("/api/pr/diff", api_pr_diff)
     app.router.add_get("/api/pr/file", api_pr_file)
     app.router.add_route("*", "/api/pr/comments", api_pr_comments)
