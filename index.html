@@ -5434,7 +5434,7 @@ function paintAcct0() {
 const GH_REPO = 'Crazy-IT-party/lagomchat';
 const CREDITS = ['martyshka', 'Luca', 'Dominic', 'Patrick', 'ovtza', 'penis lena', 'moon', 'ienrf', 'HACTEHA', 'pio', 'Fedor', 'mama', 'Masha',
   'Natasha', 'Tsoi', 'Gorshok', 'Eugene', 'Jim', 'Alexander', 'Adam', 'pupsique', 'Zello', 'Thomas', 'Sina', 'Scooby'];
-const VER = (window.AC_VER && window.AC_VER.v) || '', REV = (window.AC_VER && window.AC_VER.rev) || '';
+const VER = (window.AC_VER && window.AC_VER.v) || '', MYVER = window.__acAppVer || VER, REV = (window.AC_VER && window.AC_VER.rev) || '';
 let REL = null;                                        // GitHub's latest release once asked: {tag, url, name} or {err}
 const verNum = v => String(v || '').replace(/^v/i, '').split(/[.-]/).slice(0, 3).map(x => parseInt(x, 10) || 0);
 const verNewer = (a, b) => { const x = verNum(a), y = verNum(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return false; };
@@ -5442,8 +5442,9 @@ function relLine() {
   if (!REL) return '';
   if (REL.busy) return esc(T('Checking…'));
   if (REL.err) return esc(T('Could not reach GitHub'));
-  if (VER && verNewer(REL.tag, VER)) return `${esc(T('A new version: {v}', { v: REL.tag.replace(/^v/i, '') }))} <a href="${esc(REL.url)}" target="_blank" rel="noopener">${esc(T('What is new'))}</a>`;
-  if (!VER) return `${esc(REL.tag)} <a href="${esc(REL.url)}" target="_blank" rel="noopener">${esc(T('What is new'))}</a>`;
+  // the app compares its own version: the app is what gets downloaded (#2495)
+  if (MYVER && verNewer(REL.tag, MYVER)) return `${esc(T('A new version: {v}', { v: REL.tag.replace(/^v/i, '') }))} <a href="${esc(REL.url)}" target="_blank" rel="noopener">${esc(T('What is new'))}</a>`;
+  if (!MYVER) return `${esc(REL.tag)} <a href="${esc(REL.url)}" target="_blank" rel="noopener">${esc(T('What is new'))}</a>`;
   return esc(T('This is the latest version'));
 }
 function aboutBox() {
