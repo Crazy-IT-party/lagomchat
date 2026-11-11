@@ -1430,7 +1430,9 @@ async def op(q: dict, ws) -> dict:
         if not good:
             return {"ok": False, "error": f"upload: {name} is not a {ext[1:]} file"}
         UPLOADS.mkdir(parents=True, exist_ok=True)
-        f = UPLOADS / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}{ext}"
+        # 128 random bits in the name (the owner, #2538): the folder is one for all the chats of the machine, a name of the
+        # second and 24 bits could be guessed by a person of another chat and named in a message there to be shown
+        f = UPLOADS / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(16)}{ext}"
         f.write_bytes(data)
         return {"ok": True, "path": str(f)}
     if kind == "react_one":
@@ -2202,7 +2204,10 @@ async def api_display_name(req: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "no control characters"})
     if n and (n.lower() in {a["name"].lower() for a in chat.agents.values()} | DEPUTY):
         return web.json_response({"ok": False, "error": "that is an agent's name"})
-    if n and any(t != v["task"] and d["name"].lower() == n.lower() for t, d in chat.dnames.items()):
+    if n and any(o.get("task") != v["task"] and n.lower() in (str(o.get("name") or "").lower(), str(o.get("acct_name") or "").lower())
+                 for o in chat.viewers.values()):               # nor another person's own name (the owner, #2538: everyone picks one now)
+        return web.json_response({"ok": False, "error": "somebody else shows under that name"})
+    if n and any(t != v["task"] and str(d.get("name") or "").lower() == n.lower() for t, d in chat.dnames.items()):
         return web.json_response({"ok": False, "error": "somebody else shows under that name"})
     if n:
         chat.dnames[v["task"]] = {**cur, "name": n, "acct": v.get("acct_name") or "", "who": v["name"]}
@@ -2303,6 +2308,52 @@ def _og_parse(page: str, base: str) -> dict:
             "desc": pick("og:description", "twitter:description", "description")[:400],
             "image": urljoin(base, img)[:1000] if img and not img.startswith("data:") else "",
             "site": pick("og:site_name")[:80]}
+
+
+GH_REPO = "Crazy-IT-party/lagomchat"
+_REL_FILE = Path.home() / ".cache" / "lagomchat" / "release.json"      # one for all the chats of the machine
+_REL_LOCK = asyncio.Lock()
+
+
+def _rel_read() -> dict:
+    try:
+        d = json.loads(_REL_FILE.read_text())
+        return d if isinstance(d, dict) and isinstance(d.get("at"), (int, float)) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+async def api_release(req: web.Request) -> web.Response:
+    """GitHub's latest release for the page's 'a new version' mark (the owner, #2568): asked by the server, once in five
+    minutes for the whole machine - the answer lies in a file every chat reads - so no browser goes to GitHub (it lets one
+    address ask 60 times an hour, ten open chats asked 120) and GitHub sees nobody's address but the machine's"""
+    await need_viewer(req)
+    d = _rel_read()
+    if time.time() - d.get("at", 0) > 300:
+        async with _REL_LOCK:
+            d = _rel_read()
+            if time.time() - d.get("at", 0) > 300:
+                d = {"at": time.time(), "tag": str(d.get("tag") or ""), "url": str(d.get("url") or ""), "body": str(d.get("body") or "")}   # no answer: the last one stays, asked again in five minutes
+                try:
+                    async with ClientSession(timeout=ClientTimeout(total=10)) as s, s.get(
+                            f"https://api.github.com/repos/{GH_REPO}/releases/latest",
+                            headers={"Accept": "application/vnd.github+json", "User-Agent": "LagomChat"}) as r:
+                        if r.status == 200:
+                            j = json.loads((await r.content.read(400_000)).decode("utf-8", "replace"))
+                            url = str(j.get("html_url") or "")
+                            d.update(tag=str(j.get("tag_name") or "")[:40], body=str(j.get("body") or "")[:700],
+                                     url=url if url.startswith(f"https://github.com/{GH_REPO}/") and len(url) < 300 else f"https://github.com/{GH_REPO}/releases")
+                        else:
+                            print(f"[release] GitHub said {r.status}", flush=True)
+                except Exception as x:                  # noqa: BLE001 - no network, a broken answer: the mark is no reason to fail
+                    print(f"[release] {type(x).__name__}: {x}", flush=True)
+                try:
+                    _REL_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = _REL_FILE.with_name(f"release.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(d)); os.replace(tmp, _REL_FILE)
+                except OSError as x:
+                    print(f"[release] {x}", flush=True)
+    return web.json_response({"ok": bool(d.get("tag")), "tag": d.get("tag") or "", "url": d.get("url") or "", "body": d.get("body") or ""})
 
 
 async def api_og(req: web.Request) -> web.Response:
@@ -3984,7 +4035,7 @@ async def api_upload(req: web.Request):
     elif not data.startswith(UP_MAGIC[ext]) or (ext == ".webp" and data[8:12] != b"WEBP") or len(data) > 25 * 2 ** 20:
         raise web.HTTPUnsupportedMediaType(text="not a picture of that type (or over 25 MB)")
     UPLOADS.mkdir(parents=True, exist_ok=True)
-    stem = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+    stem = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(16)}"   # not to be guessed from another chat (the owner, #2538)
     p = UPLOADS / f"{stem}{ext}"
     p.write_bytes(data)
     if ext in (".mov", ".avi", ".mkv"):                 # made mp4: what every browser plays (a mov may be HEVC, an avi / mkv anything)
@@ -4788,6 +4839,7 @@ def main():
     app.router.add_get("/api/pr", api_pr)
     app.router.add_get("/api/x", api_x)
     app.router.add_get("/api/og", api_og)
+    app.router.add_get("/api/release", api_release)
     app.router.add_get("/api/pr/diff", api_pr_diff)
     app.router.add_get("/api/pr/file", api_pr_file)
     app.router.add_route("*", "/api/pr/comments", api_pr_comments)
