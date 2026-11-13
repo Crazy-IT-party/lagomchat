@@ -8,6 +8,8 @@ One document per rated message in the collection `ratings` of the database `agen
     current    {delta, rater: {id, name}, ts} | null     the vote now (+1 / -1), null when it was taken back
     history    [{delta, rater, ts}, ...]                 every change of the vote, oldest first (delta 0 = taken back)
     deleted    {by: {id, name}, ts}                      only when the owner deleted the message (the message stays here)
+The collection `views`: one document per seen message, _id "<the chat's data folder>:<message id>", {chat, message, by: {<person's
+id>: when they saw it}} - a person counts once, after the message stood on their screen for two seconds.
 
 `rater` is who voted: the owner (id owner), other people by their id. The URI: env LAGOMCHAT_MONGO, else the first line of
 ~/.config/agentchat/mongo (it can hold a password: not in the repo). Without a URI or a server nothing breaks: a write
@@ -78,7 +80,8 @@ class RatingsDB:
             upd["$setOnInsert"] = conv(op["insert"])
         if op.get("push"):
             upd["$push"] = {"history": conv(op["push"])}
-        self.col.update_one({"_id": op["id"]}, upd, upsert=True)
+        col = self.col.database[op["col"]] if op.get("col") else self.col      # the views of the messages: their own collection
+        col.update_one({"_id": op["id"]}, upd, upsert=True)
 
     def submit(self, op: dict) -> bool:
         """write now (blocking: the server runs it in a thread); on a failure the op waits in the pending file"""

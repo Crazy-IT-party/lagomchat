@@ -31,6 +31,7 @@ from __future__ import annotations
 from html import escape as html_escape
 import asyncio
 import base64
+import bisect
 import fcntl
 import hashlib
 import importlib
@@ -39,7 +40,9 @@ import math
 import os
 import re
 import secrets
+import shutil
 import socket
+import tempfile
 import urllib.parse
 import sys
 import time
@@ -353,6 +356,29 @@ class Chat:
                 try:
                     self.apply(json.loads(s))
                 except (ValueError, KeyError):
+                    pass
+        # a person changes their own message (the owner, #2930): chat.jsonl keeps it as it was sent, edits.jsonl every change of it;
+        # the newest text is the one shown, with the time of the change
+        self.edits_file = DATA / "edits.jsonl"
+        if self.edits_file.exists():
+            byid = {e["id"]: e for e in self.events}
+            for s_ in self.edits_file.read_text().splitlines():
+                try:
+                    r_ = json.loads(s_)
+                    if int(r_["id"]) in byid:
+                        byid[int(r_["id"])]["text"], byid[int(r_["id"])]["edited"] = str(r_["text"]), float(r_["ts"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+        # who has seen a message (the owner, #2930): message id -> {the person's id: when}. The page tells when a message stood on
+        # the person's screen for two seconds; one view per person. Kept here, and in MongoDB when one is set up (ratings_db.py)
+        self.views_file = DATA / "views.jsonl"
+        self.views: dict[int, dict[str, float]] = {}
+        if self.views_file.exists():
+            for s_ in self.views_file.read_text().splitlines():
+                try:
+                    r_ = json.loads(s_)
+                    self.views.setdefault(int(r_["id"]), {})[str(r_["v"])] = float(r_["ts"])
+                except (ValueError, KeyError, TypeError):
                     pass
         self.agent_run, self.agent_paused = 0, False   # agents' messages in a row with no person's (#2285)
         self.next_id = self.events[-1]["id"] + 1 if self.events else 1
@@ -840,6 +866,57 @@ class Chat:
             if str(self.rater_of(v)["id"]) != rid:
                 await send(w, m)
 
+    async def edit(self, mid: int, text: str, me: dict) -> str:
+        """a person changes the text of their own message (the owner, #2930): the pages show the new text marked as edited.
+        Returns what is wrong, or "" """
+        e = next((x for x in self.events if x["id"] == mid), None)
+        if not e or e["kind"] != "msg" or mid in self.deleted or me["role"] not in ("owner", "verified") or e["task"] != me["task"]:
+            return "only your own message can be edited"
+        if e.get("poll") or e.get("doc") or e.get("sh"):
+            return "this message cannot be edited"
+        text = text.strip()[:8000]
+        if not text or text == e["text"]:
+            return ""
+        now = round(time.time(), 3)
+        with self.edits_file.open("a") as f:
+            f.write(json.dumps({"id": mid, "ts": now, "text": text, "was": e["text"]}, ensure_ascii=False) + "\n")
+        e["text"], e["edited"] = text, now
+        await asyncio.to_thread(self.vec.drop, {mid})            # the search by meaning takes the new text in
+        m = json.dumps({"type": "edit", "id": mid, "text": text, "edited": now}, ensure_ascii=False)
+        for ws in list(self.watchers):
+            v = self.viewers.get(ws) or {"role": "owner", "id": ""}
+            if v["role"] == "owner" or mid >= self.start_for(v):
+                await send(ws, m)
+        print(f"[edit] #{mid} by {me.get('name')}", flush=True)
+        return ""
+
+    def views_key(self, mid: int) -> str:
+        return f"{DATA.name}:{mid}"
+
+    async def viewed(self, ids: list, me: dict, start: int) -> None:
+        """messages that stood on this person's screen (the owner, #2930): one view per person and message"""
+        rid, now, new = str(self.rater_of(me)["id"]), round(time.time(), 3), []
+        for mid in ids[:200]:
+            if not isinstance(mid, int) or isinstance(mid, bool) or mid < start or mid in self.deleted or rid in self.views.get(mid, ()):
+                continue
+            i = bisect.bisect_left(self.events, mid, key=lambda x: x["id"])
+            if i < len(self.events) and self.events[i]["id"] == mid and self.events[i]["kind"] == "msg":
+                self.views.setdefault(mid, {})[rid] = now
+                new.append(mid)
+        if not new:
+            return
+        with self.views_file.open("a") as f:
+            f.write("".join(json.dumps({"id": mid, "v": rid, "ts": now}) + "\n" for mid in new))
+        if self.rdb.uri:
+            for mid in new:
+                await self.to_mongo({"col": "views", "id": self.views_key(mid), "set": {"chat": DATA.name, "message": mid, "by." + rid.replace(".", "_"): now}})
+        for ws in list(self.watchers):
+            v = self.viewers.get(ws) or {"role": "owner", "id": ""}
+            st = 0 if v["role"] == "owner" else self.start_for(v)
+            cnt = {str(mid): len(self.views[mid]) for mid in new if mid >= st}
+            if cnt:
+                await send(ws, json.dumps({"type": "views", "v": cnt, **({"mine": new} if str(self.rater_of(v)["id"]) == rid else {})}))
+
     async def delete(self, mid: int) -> None:
         e = next((x for x in self.events if x["id"] == mid), None)
         if not e or e["kind"] != "msg" or str(e["task"]).startswith("user") or mid in self.deleted:
@@ -903,6 +980,8 @@ class Chat:
         for t, evs in self.pend.items():
             self.pend[t] = [e for e in evs if e["id"] not in ids]
         await asyncio.to_thread(self.vec.drop, ids)
+        for i in ids:
+            self.views.pop(i, None)
         await self.watch_all({"type": "purged", "ids": sorted(ids), "first": self.events[0]["id"] if self.events else 0})
         if any(p["id"] in ids for p in self.pins):
             self.pins = [p for p in self.pins if p["id"] not in ids]
@@ -1251,10 +1330,12 @@ class Chat:
         return sorted(out.values(), key=lambda u: (u["role"] != "owner", u["name"].lower()))
 
     async def send_presence(self) -> None:
+        people = access_people()
         for ws in list(self.watchers):
             me = self.viewers.get(ws)
             if me:
-                await send(ws, json.dumps({"type": "presence", "users": self.presence(me["role"] == "owner", me)}, ensure_ascii=False))
+                await send(ws, json.dumps({"type": "presence", "users": self.presence(me["role"] == "owner", me),
+                                           "people": people}, ensure_ascii=False))
 
     async def watch_all(self, m: dict) -> None:
         s = json.dumps(m, ensure_ascii=False)
@@ -2064,6 +2145,19 @@ def human_name(sess: dict) -> str:
     return n if n.lower() not in USER_NAMES and n not in {a["name"] for a in chat.agents.values()} else n + "_h"
 
 
+def access_people() -> dict[str, str]:
+    """everyone let into the chat by email, on its page now or not: the name they go by here -> the display name they picked
+    ('' with none). They are tagged and put into an event like the ones present (the owner, #2914). A whole domain let in has
+    no list of its people; the owner is not in it: he is 'owner'"""
+    out, own = {}, auth.owner_email()
+    for em in auth.allow_list()["google_emails"]:
+        if em == own:
+            continue
+        sess = {"sid": auth.email_sid(em), "name": em.split("@")[0], "em": em}
+        out[human_name(sess)] = str(chat.dnames.get("user:" + sess["sid"], {}).get("name") or "")
+    return out
+
+
 async def viewer_of(req: web.Request) -> dict:
     v = await _viewer_of(req)
     v["acct_avatar"] = v.get("avatar", "")
@@ -2421,6 +2515,143 @@ async def _og_get(url: str, limit: int = 600_000) -> tuple[str, str] | None:
     return None
 
 
+# A picture of the page itself for a card whose page names none (the owner, #2923): made by a headless Chrome of the chat's
+# machine. Chrome reaches the net only through a proxy of this process that lets a connection out to public addresses alone,
+# as the cards' own fetch does: no page, redirect or script of it gets at this machine, its LAN or its tunnels.
+SHOTS = DATA / "shots"
+SHOT_KEEP = 7 * 86400
+_SHOT_SEM = asyncio.Semaphore(1)
+_SHOT_PROXY: dict = {}
+
+
+def _chrome() -> str:
+    for p in (os.environ.get("LAGOMCHAT_CHROME", ""), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              *(shutil.which(n) or "" for n in ("google-chrome", "chromium", "chromium-browser", "chrome-headless-shell"))):
+        if p and os.access(p, os.X_OK):
+            return p
+    return ""
+
+
+async def _shot_pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+    try:
+        while chunk := await r.read(65536):
+            w.write(chunk)
+            await w.drain()
+    except (OSError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        w.close()
+
+
+async def _shot_proxy_conn(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+    """one connection of Chrome: CONNECT host:port, or a plain http request; the host's addresses are checked, and the
+    connection goes to the address that was checked"""
+    up = None
+    try:
+        head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 10)
+        line = head.split(b"\r\n", 1)[0].decode("latin-1").split()
+        if len(line) < 2:
+            return
+        if line[0] == "CONNECT":
+            host, _, port = line[1].rpartition(":")
+        else:
+            u = urlparse(line[1])
+            host, port = u.hostname or "", str(u.port or 80)
+        host = host.strip("[]")
+        infos = await asyncio.get_running_loop().getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
+        ips = [i[4][0].split("%")[0] for i in infos]
+        if not ips or not all(_og_ip_ok(a) for a in ips) or int(port) not in (80, 443):
+            w.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await w.drain()
+            return
+        ur, uw = await asyncio.wait_for(asyncio.open_connection(ips[0], int(port)), 10)
+        up = uw
+        if line[0] == "CONNECT":
+            w.write(b"HTTP/1.1 200 OK\r\n\r\n")
+            await w.drain()
+        else:
+            uw.write(head)
+            await uw.drain()
+        await asyncio.wait([asyncio.ensure_future(_shot_pipe(r, uw)), asyncio.ensure_future(_shot_pipe(ur, w))], timeout=40)
+    except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        pass
+    finally:
+        for x in (w, up):
+            if x:
+                x.close()
+
+
+async def _og_shot(url: str) -> str:
+    """the name of the page's picture in SHOTS ('' when it cannot be made): 1200 x 750 as a browser shows it, kept a week"""
+    name = hashlib.sha256(url.encode()).hexdigest()[:24] + ".jpg"
+    out = SHOTS / name
+    if out.exists() and time.time() - out.stat().st_mtime < SHOT_KEEP:
+        return name
+    exe = _chrome()
+    if not exe or _SHOT_PROXY.get("wait", 0) >= 4:           # a few wait for the one Chrome at most: the rest get the card without a picture
+        return ""
+    _SHOT_PROXY["wait"] = _SHOT_PROXY.get("wait", 0) + 1
+    try:
+        return await _og_shot_make(url, exe, name, out)
+    finally:
+        _SHOT_PROXY["wait"] -= 1
+
+
+async def _og_shot_make(url: str, exe: str, name: str, out: Path) -> str:
+    async with _SHOT_SEM:
+        if "port" not in _SHOT_PROXY:
+            srv = await asyncio.start_server(_shot_proxy_conn, "127.0.0.1", 0)
+            _SHOT_PROXY["port"] = srv.sockets[0].getsockname()[1]
+            _SHOT_PROXY["srv"] = srv
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        if time.time() - _SHOT_PROXY.get("swept", 0) > 86400:    # once a day: the pictures older than a week go
+            _SHOT_PROXY["swept"] = time.time()
+            for f in SHOTS.glob("*.jpg"):
+                try:
+                    if time.time() - f.stat().st_mtime > SHOT_KEEP:
+                        f.unlink()
+                except OSError:
+                    pass
+        tmp = tempfile.mkdtemp(prefix="lagomshot-")
+        png, pr = Path(tmp) / "s.png", None
+        try:
+            pr = await asyncio.create_subprocess_exec(
+                exe, "--headless=new", f"--user-data-dir={tmp}/p", "--no-first-run", "--disable-extensions",
+                "--disable-gpu", "--mute-audio", "--hide-scrollbars", "--window-size=1200,750", "--virtual-time-budget=4000",
+                f"--proxy-server=http://127.0.0.1:{_SHOT_PROXY['port']}", "--proxy-bypass-list=<-loopback>", "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-background-networking",
+                f"--screenshot={png}", url, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(pr.wait(), 30)
+            if png.exists() and png.stat().st_size > 2000:
+                def conv() -> bool:
+                    from PIL import Image
+                    im = Image.open(png).convert("RGB")
+                    if len(set(im.resize((16, 10)).getdata())) < 3:      # a blank page says nothing
+                        return False
+                    im.resize((800, 500)).save(out, "JPEG", quality=82)
+                    return True
+                if await asyncio.get_running_loop().run_in_executor(None, conv):
+                    return name
+        except (OSError, asyncio.TimeoutError, ValueError) as x:
+            print(f"[shot] {type(x).__name__}", flush=True)
+        finally:
+            if pr and pr.returncode is None:
+                try:
+                    pr.kill()
+                except ProcessLookupError:
+                    pass
+            shutil.rmtree(tmp, ignore_errors=True)
+    return ""
+
+
+async def api_shot(req: web.Request) -> web.Response:
+    await need_viewer(req)
+    name = req.match_info["name"]
+    if not re.fullmatch(r"[0-9a-f]{24}\.jpg", name) or not (SHOTS / name).exists():
+        raise web.HTTPNotFound()
+    return web.FileResponse(SHOTS / name, headers={"Cache-Control": "private, max-age=86400"})
+
+
 def _og_parse(page: str, base: str) -> dict:
     """the card's words and picture from a page's own tags: og:, twitter:, then <title> and the description"""
     import html as _h
@@ -2517,6 +2748,10 @@ async def api_og(req: web.Request) -> web.Response:
                 c = await asyncio.get_running_loop().run_in_executor(None, _og_parse, got[1], got[0])
                 if c["title"] or c["desc"] or c["image"]:
                     out = {"ok": True, **c}
+            if not out.get("image") and await _og_public(host):           # no picture of its own: the page as a browser shows it
+                shot = await _og_shot(got[0] if got else url)
+                if shot:
+                    out = {"title": "", "desc": "", "site": "", **out, "ok": True, "image": "", "shot": shot}
     except (ClientError, asyncio.TimeoutError, OSError, ValueError, LookupError, AttributeError, TypeError) as x:
         print(f"[og] {type(x).__name__}", flush=True)
     if len(_OG_CACHE) > 3000:
@@ -3300,6 +3535,8 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                                   "agents": chat.roster(), "known": chat.known_agents(), "allow_all": chat.allow_all, "sound_presets": SOUND_PRESETS, "stt": bool(eleven_key()), "rimgs": _rimgs_out(), "photo": chat.photos.get(me.get("task") or ""), "loops": {str(i): v for i, v in chat.loops.items() if i >= lo}, "events": evs, "v": page_version(), "title": chat.title, "title_tr": chat.title_tr, "aliases": chat.aliases.get(viewer_key(me), {}), "names": chat.dnames, "agent_cols": chat.agent_cols,
                                   "acks": {str(i): v for i, v in chat.acks.items() if i >= lo},
                                   "trans": {str(i): v for i, v in chat.trans.items() if i >= start},
+                                  "views": {str(i): len(v) for i, v in chat.views.items() if i >= start},
+                                  "viewed": (lambda rid: [i for i, v in chat.views.items() if i >= start and rid in v])(str(chat.rater_of(me)["id"])),
                                   "pins": chat.pins_view(0 if me["role"] == "owner" else start),
                                   "tally": {str(i): t for i in chat.votes if i >= start and (t := chat.tally(i))},
                                   "polls": {str(i): chat.poll_view(i, me.get("name") or "owner") for i in chat.polls if i >= start},
@@ -3525,6 +3762,18 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                     if bad:
                         await send(ws, json.dumps({"type": "error", "error": bad}))
                 continue
+            if q.get("edit") is not None:                        # a person changes their own message (#2930)
+                try:
+                    bad = await chat.edit(int(q["edit"]), str(q.get("text") or ""), me) if _ws_rate(me, "edit", 2) else ""
+                except (TypeError, ValueError):
+                    bad = ""
+                if bad:
+                    await send(ws, json.dumps({"type": "error", "error": bad}))
+                continue
+            if isinstance(q.get("views"), list):                 # messages that stood on this person's screen for two seconds (#2930)
+                if me["role"] in ("owner", "verified") and _ws_rate(me, "views", 4):
+                    await chat.viewed(q["views"], me, start)
+                continue
             if q.get("typing"):                                  # a person is typing: the others' pages show it for a few seconds
                 await chat.typing(ws, me)
                 continue
@@ -3662,7 +3911,7 @@ def settings() -> dict:
 # {email: {"all": bool, "prefs": {key: value}}}; only the keys the page lists, short strings
 SHARED_PREFS = Path(os.environ.get("LAGOMCHAT_SHARED_PREFS", Path.home() / ".config/agentchat-chats/prefs.json"))
 PREF_KEYS = {"ac_theme", "ac_lang", "ac_tsz", "ac_tbs", "ac_sbs", "ac_side", "ac_enter", "ac_hidevotes", "ac_hidesys", "ac_hidetr",
-             "ac_joinsnd", "ac_awayafter"}
+             "ac_joinsnd", "ac_awayafter", "ac_hideviews"}
 
 
 def _shared_prefs_load() -> dict:
@@ -5266,6 +5515,12 @@ async def mongo_loop() -> None:
                     for _, op in sorted(ops, key=lambda x: x[0]):
                         await chat.to_mongo(op)
                     marker.write_text(str(len(ops)))
+                vmark = DATA / "mongo_views_backfilled"           # the views counted before the database was there (#2930)
+                if not vmark.exists():
+                    for mid, by in list(chat.views.items()):
+                        await chat.to_mongo({"col": "views", "id": chat.views_key(mid),
+                                             "set": {"chat": DATA.name, "message": mid, **{"by." + r.replace(".", "_"): t for r, t in by.items()}}})
+                    vmark.write_text(str(len(chat.views)))
                 await asyncio.to_thread(chat.rdb.flush)
         except Exception as x:                                     # never takes the chat down
             chat.rdb.error = str(x)[:200]
@@ -5381,6 +5636,7 @@ def main():
     app.router.add_get("/api/pr", api_pr)
     app.router.add_get("/api/x", api_x)
     app.router.add_get("/api/og", api_og)
+    app.router.add_get("/api/shot/{name}", api_shot)
     app.router.add_get("/api/release", api_release)
     app.router.add_route("*", "/api/calendar", api_calendar)
     app.router.add_get("/api/clocks", api_clocks)
