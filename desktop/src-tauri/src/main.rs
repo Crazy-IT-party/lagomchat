@@ -238,7 +238,7 @@ fn change_address(app: &AppHandle) -> tauri::Result<()> {
 // the people thanked in the About window (the owner, #2365, #2369): the Mac shows them as its credits, Linux as the authors
 const CREDITS: &[&str] = &[
     "martyshka", "Luca", "Dominic", "Patrick", "ovtza", "penis lena", "moon", "ienrf", "HACTEHA", "pio", "Fedor", "mama", "Masha",
-    "Natasha", "Tsoi", "Gorshok", "Eugene", "Jim", "Alexander", "Adam", "pupsique", "Zello", "Thomas", "Sina", "Scooby",
+    "Natasha", "Tsoi", "Gorshok", "Eugene", "Jim", "Alexander", "Adam", "pupsique", "Zello", "Thomas", "Sina", "Scooby", "elkraino",
 ];
 
 fn about() -> AboutMetadata<'static> {

@@ -4860,6 +4860,7 @@ def remind_cmd(who: dict, arg: str) -> str:
 CAL_OFFS = (1440, 60, 10, 5)            # minutes before an event a participant may be told at: a day, an hour, 10 and 5 minutes
 CAL_OFF_TXT = {1440: "1 day", 60: "1 hour", 10: "10 minutes", 5: "5 minutes"}
 CAL_MAX, CAL_KEEP = 500, 30 * 86400     # events at most; one that is over is kept a month
+CAL_SLOTS = 300                         # slots of one person in one event at most: a week of whole days cut into hours fits (#2964)
 CAL_MAX_MINE = 30                       # ... and of one maker who is not the owner: a guest does not fill the calendar
 
 
@@ -4868,10 +4869,12 @@ def _cal_me(v: dict) -> str:
 
 
 def _cal_out(v: dict) -> list[dict]:
-    me = _cal_me(v)
+    me, now = _cal_me(v), time.time()
     return [{"id": e["id"], "title": e["title"], "at": e["at"], "by": e["by_name"], "by_task": e["by_task"], "who": e["who"],
              "mine": v["role"] == "owner" or e["by_task"] == v["task"], "in": me in e["who"], "notify": e.get("notify", {}).get(me, []),
-             **({"dur": e["dur"], "voters": e.get("voters", []), "slots": e.get("slots", {}), "vote": me in e.get("voters", []) and not e.get("dl_told"),
+             **({"dur": e["dur"], "voters": e.get("voters", []), "slots": {me: e.get("slots", {}).get(me, [])},
+                 # the slots of the others are not shown while the time is looked for (the owner, #2972): only who has given some
+                 "gave": [n for n in e.get("voters", []) if any(t > now for t in e.get("slots", {}).get(n, []))], "vote": me in e.get("voters", []) and not e.get("dl_told"),
                  "dl": e.get("dl", 0)} if e.get("dur") else {})}
             for e in sorted(chat.cal, key=lambda e: e["at"])]
 
@@ -4903,7 +4906,8 @@ async def api_calendar(req: web.Request) -> web.Response:
     """the chat's calendar (the owner, #2704). GET: the events as this viewer sees them. POST {op: add, title, at, who: [names]}: a new one,
     its maker is in it; {op: del, id}: by its maker or the owner, who also take a participant out: {op: unwho, id, name}; {op: notify, id, offs: [minutes]}: a participant's own reminders.
     {op: add, title, dur: minutes, who} is an event without a date: {op: slot / unslot, id, at} is a time that suits the one who sends it;
-    {op: who, id, name}: its maker or the owner adds a person later, and a time found by slots is open again"""
+    {op: who, id, name}: its maker or the owner adds a person later, and a time found by slots is open again;
+    {op: dl, id, dl}: they move the deadline of an event that still looks for its time; {op: slot, id, ats: [times]}: several slots at once"""
     v = await need_viewer(req)
     if req.method == "GET":
         return web.json_response({"ok": True, "events": _cal_out(v), "offs": CAL_OFFS}, headers={"Cache-Control": "no-store"})
@@ -4939,21 +4943,30 @@ async def api_calendar(req: web.Request) -> web.Response:
             return web.json_response({"ok": False, "error": "not_yours"}, status=403)
         chat.cal.remove(ev)
     elif op_ in ("slot", "unslot") and ev:
-        try:
-            t = int(q.get("at"))
-        except (TypeError, ValueError):
-            t = 0
+        t, ats = _int(q.get("at")), q.get("ats")
         if ev["at"] or not ev.get("dur") or me not in ev.get("voters", []):
             return web.json_response({"ok": False, "error": "not_in"}, status=403)
         mine = ev.setdefault("slots", {}).setdefault(me, [])
         if op_ == "unslot":
             if t in mine:
                 mine.remove(t)
-        elif not (now < t < now + 2 * 366 * 86400) or len(mine) >= 60:
+        elif isinstance(ats, list):
+            # a span of time cut into slots comes as one request (the audit before 0.6.0): one write of the file and one word to
+            # the pages, not one per slot. A slot that does not fit (passed, after the deadline, over the limit) is left out
+            mine[:] = [x for x in mine if x > now]           # the ones that passed are dropped: the list does not grow for ever
+            for x in ats[:CAL_SLOTS]:
+                x = _int(x)
+                if len(mine) >= CAL_SLOTS:
+                    break
+                if now < x < now + 2 * 366 * 86400 and x not in mine and not (ev.get("dl") and x + ev["dur"] * 60 > ev["dl"]):
+                    mine.append(x)
+            mine.sort()
+        elif not (now < t < now + 2 * 366 * 86400) or len([x for x in mine if x > now]) >= CAL_SLOTS:      # the ones that passed do not count (#2964)
             return web.json_response({"ok": False, "error": "bad_request"}, status=400)
         elif ev.get("dl") and t + ev["dur"] * 60 > ev["dl"]:
             return web.json_response({"ok": False, "error": "after_deadline"})
         elif t not in mine:
+            mine[:] = [x for x in mine if x > now]           # the ones that passed are dropped: the list does not grow for ever
             mine.append(t)
             mine.sort()
         fixed = _cal_common(ev, now)
@@ -4979,6 +4992,20 @@ async def api_calendar(req: web.Request) -> web.Response:
             _cal_save()
             await chat.post("remind", {"name": ev["by_name"], "task": ev["by_task"]}, f'{ev["title"]}: the time is set, {when_txt(fixed)}',
                             to=list(ev["who"]), cal={"id": ev["id"], "title": ev["title"], "at": fixed, "fix": True})
+    elif op_ == "dl" and ev:                                 # the deadline moved by the event's maker or the owner (#2958): a day and a time
+        dl = _int(q.get("dl"))
+        if not (v["role"] == "owner" or ev["by_task"] == v["task"]):
+            return web.json_response({"ok": False, "error": "not_yours"}, status=403)
+        if ev["at"] or not ev.get("dur") or not (now + ev["dur"] * 60 < dl < now + 2 * 366 * 86400):
+            return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        if dl != ev.get("dl"):
+            ev["dl"] = dl
+            ev.pop("dl_told", None)                          # a deadline that was over and is moved on: the slots are open again
+            for sl in ev.get("slots", {}).values():          # a slot that ends after the new deadline is gone
+                sl[:] = [t for t in sl if t + ev["dur"] * 60 <= dl]
+            _cal_save()
+            await chat.post("remind", {"name": ev["by_name"], "task": ev["by_task"]}, f'{ev["title"]}: the deadline is now {when_txt(dl)}',
+                            to=list(ev["who"]), cal={"id": ev["id"], "title": ev["title"], "at": 0, "dl": dl})
     elif op_ == "who" and ev:                                # a person added to an event already made, by its maker or the owner (#2909)
         n = q.get("name")
         if not (v["role"] == "owner" or ev["by_task"] == v["task"]):
