@@ -1324,7 +1324,10 @@ class Chat:
                 u["showtz"] = True
             sts = u.pop("_st", [])
             if key in self.away_manual:
-                u.update(st="away", stby="manual", age=max(0.0, round(time.time() - self.away_manual[key], 1)))
+                # by hand: away (a time, as it was kept before), or busy / sleep (the owner, #3020): {at, kind}
+                m = self.away_manual[key]
+                at, kind = (m.get("at", 0), m.get("kind", "away")) if isinstance(m, dict) else (m, "away")
+                u.update(st=kind if kind in ("busy", "sleep") else "away", stby="manual", age=max(0.0, round(time.time() - at, 1)))
             elif sts and all(st == "auto" for st, _ in sts):
                 u.update(st="away", stby="auto", age=max(0.0, round(time.time() - max(at for _, at in sts), 1)))
         return sorted(out.values(), key=lambda u: (u["role"] != "owner", u["name"].lower()))
@@ -3595,6 +3598,18 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                 print(f"[scr] {me.get('name')}@{me.get('ip')}: {'on' if me['scr'] else 'off'}", flush=True)
                 await chat.send_presence()
                 continue
+            if q.get("st_set") in ("here", "away", "busy", "sleep"):   # the status by hand, one of four (the owner, #3020); with it away_set is not read
+                k, kind = me["id"] or me["name"], q["st_set"]
+                cur = chat.away_manual.get(k)
+                was = "here" if cur is None else cur.get("kind", "away") if isinstance(cur, dict) else "away"
+                if kind != was:
+                    if kind == "here":
+                        chat.away_manual.pop(k, None)
+                    else:
+                        chat.away_manual[k] = round(time.time(), 1) if kind == "away" else {"at": round(time.time(), 1), "kind": kind}
+                    chat.away_file.write_text(json.dumps(chat.away_manual, ensure_ascii=False))
+                    await chat.send_presence()
+                continue
             if q.get("away_set") is not None:                    # Away by hand, for the person on all their devices (#2065)
                 k = me["id"] or me["name"]
                 if bool(q["away_set"]) != (k in chat.away_manual):
@@ -4875,25 +4890,66 @@ def _cal_out(v: dict) -> list[dict]:
              **({"dur": e["dur"], "voters": e.get("voters", []), "slots": {me: e.get("slots", {}).get(me, [])},
                  # the slots of the others are not shown while the time is looked for (the owner, #2972): only who has given some
                  "gave": [n for n in e.get("voters", []) if any(t > now for t in e.get("slots", {}).get(n, []))], "vote": me in e.get("voters", []) and not e.get("dl_told"),
-                 "dl": e.get("dl", 0)} if e.get("dur") else {})}
-            for e in sorted(chat.cal, key=lambda e: e["at"])]
+                 "dl": e.get("dl", 0),
+                 # no time suits everyone: the slots of mine that would make it happen, and who else has such a slot (2026-11-15)
+                 **({"hint": h.get(me, []), "fix": [n for n in h if n != me and h[n]]} if h else {})} if e.get("dur") else {})}
+            for e in sorted(chat.cal, key=lambda e: e["at"]) for h in [_cal_hints(e, now)]]
+
+
+def _cal_free(e: dict, n: str, now: float) -> list[list[int]]:
+    """the free stretches of one person of an event that looks for its time: slots that touch or overlap are one stretch"""
+    dur, free = e["dur"] * 60, []
+    for a in sorted(x for x in e.get("slots", {}).get(n, []) if x > now):
+        if free and a <= free[-1][1]:
+            free[-1][1] = max(free[-1][1], a + dur)
+        else:
+            free.append([a, a + dur])
+    return free
+
+
+def _cal_meet(e: dict, now: float, skip: str = "") -> list[list[int]]:
+    """the stretches in which the event's whole length fits every one who answers (but `skip`)"""
+    dur, common = e["dur"] * 60, None
+    for n in e.get("voters", []):
+        if n == skip:
+            continue
+        free = _cal_free(e, n, now)
+        common = free if common is None else [[max(a, c), min(b, d)] for a, b in common for c, d in free if min(b, d) - max(a, c) >= dur]
+        if not common:
+            return []
+    return common or []
 
 
 def _cal_common(e: dict, now: float) -> int:
     """an event that looks for its time (the owner, #2706): the earliest start at which the event's whole length lies inside the slots of
     every one who answers. A person's slots that touch or overlap are one free stretch, so 14:00 + 15:00 of one and 14:30 of another meet"""
-    dur, common = e["dur"] * 60, None
-    for n in e.get("voters", []):
-        free: list[list[int]] = []
-        for a in sorted(x for x in e.get("slots", {}).get(n, []) if x > now):
-            if free and a <= free[-1][1]:
-                free[-1][1] = max(free[-1][1], a + dur)
-            else:
-                free.append([a, a + dur])
-        common = free if common is None else [[max(a, c), min(b, d)] for a, b in common for c, d in free if min(b, d) - max(a, c) >= dur]
-        if not common:
-            return 0
+    common = _cal_meet(e, now)
     return min(a for a, _ in common) if common else 0
+
+
+CAL_HINTS = 3                           # slots suggested to one person of an event at most
+
+
+def _cal_hint(e: dict, me: str, now: float) -> list[int]:
+    """no time suits everyone, and one slot of `me` would change that (the owner, 2026-11-15): the starts of such slots, the ones next
+    to the slots `me` has given first - an hour earlier or later is the gentle ask. They lie where everybody else is free, one for a
+    stretch; nothing when two of the others do not meet, for then no slot of `me` helps"""
+    dur, dl, mine, out = e["dur"] * 60, e.get("dl") or 0, _cal_free(e, me, now), []
+    for a, b in _cal_meet(e, now, skip=me):
+        b = min(b, dl) if dl else b
+        if b - a < dur:
+            continue
+        cand = {a, b - dur} | {min(max(x, a), b - dur) for c, d in mine for x in (c - dur, c, d - dur, d)}
+        # how far the slot is from what `me` has given: 0 = it touches a stretch of theirs
+        out.append(min((min((max(c - t - dur, t - d, 0) for c, d in mine), default=1 << 40), t) for t in cand if t > now))
+    return [t for _, t in sorted(out)[:CAL_HINTS]]
+
+
+def _cal_hints(e: dict, now: float) -> dict[str, list[int]]:
+    """the hints of every one who answers an event that still looks for its time; nothing for any other event"""
+    if not e.get("dur") or e["at"] or e.get("dl_told") or len(e.get("voters", [])) < 2:
+        return {}
+    return {n: _cal_hint(e, n, now) for n in e["voters"]}
 
 
 def _cal_save() -> None:
