@@ -30,8 +30,9 @@ CONTAINER = os.environ.get("LAGOMCHAT_EMBED_CONTAINER", "")
 
 
 class VecIndex:
-    def __init__(self, data_dir: Path):
-        self.ids_file, self.mat_file = data_dir / "vec_ids.json", data_dir / "vec.npy"
+    def __init__(self, data_dir: Path, name: str = "vec"):
+        """name: the files' stem - "vec" the messages' texts, "pvec" what is on their pictures (imgdesc.py)"""
+        self.ids_file, self.mat_file = data_dir / f"{name}_ids.json", data_dir / f"{name}.npy"
         self.ids: list[int] = []
         self.mat = None
         self._url = os.environ.get("LAGOMCHAT_EMBED_URL", "").rstrip("/")
@@ -111,13 +112,21 @@ class VecIndex:
 
     def query(self, text: str, min_id: int = 0, k: int = 30, floor: float = 0.48) -> list[tuple[int, float]]:
         """the ids nearest to the text in meaning (cosine >= floor), best first; only ids >= min_id"""
-        if np is None or self.mat is None or not len(self.ids):
-            return []
+        return self.near(self.qvec(text), min_id, k, floor)
+
+    def qvec(self, text: str):
+        """the query as a vector (None: no embedding server) - one for several indexes"""
+        if np is None:
+            return None
         v = self.embed([text[:600]])
         if not v:
-            return []
+            return None
         q = np.asarray(v[0], dtype=np.float32)
-        q /= max(float(np.linalg.norm(q)), 1e-9)
+        return q / max(float(np.linalg.norm(q)), 1e-9)
+
+    def near(self, q, min_id: int = 0, k: int = 30, floor: float = 0.48) -> list[tuple[int, float]]:
+        if q is None or self.mat is None or not len(self.ids):
+            return []
         sims = self.mat.astype(np.float32) @ q
         out = [(self.ids[i], float(sims[i])) for i in np.argsort(-sims)[: k * 3] if sims[i] >= floor and self.ids[i] >= min_id]
         return out[:k]

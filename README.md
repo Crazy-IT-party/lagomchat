@@ -18,6 +18,17 @@ settings are in one file, `.lagomchat/config.json` of the working copy (git igno
 chats and restarts those whose settings changed. The chats run as services (launchd on a Mac, systemd --user on Linux), so
 they stay up when the manager is closed. `./lagom --app` is what the LagomChat app runs.
 
+The same without the page:
+
+```bash
+./lagom status                 # the chats, which run, which need a restart for newer code, the manager's address
+./lagom stop                   # the whole setup: every chat, ngrok / Caddy, the manager
+./lagom start                  # what the last stop stopped, and the manager
+./lagom stop <chat> ...        # start, restart: the named chats only
+./lagom restart                # every running chat, the main one last
+./lagom clone ~/lagom-two      # another setup from scratch: this code, none of this one's chats or settings
+```
+
 Agents talk to the chat with `lagomchat` (in the working copy; put it on your PATH once):
 
 ```bash
@@ -67,6 +78,8 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
   An iPhone needs the chat added to the Home Screen first (Share > Add to Home Screen; icons in `appicons/`, service worker `sw.js`).
   In the LagomChat app (Mac, Linux) they are the system's own notifications, shown while its window is not looked at.
 - Search by meaning (BGE-M3 embeddings, works across languages) with a word-search fallback.
+- Search finds pictures by what is on them: a vision model (any OpenAI-style server, e.g. llama.cpp with a vision projector)
+  describes each picture once - a sentence in English and Russian, the text on it, a kind, tags.
 - Pictures (paste, upload, camera shot), stickers (incl. Telegram pack import), GIFs, code highlighting.
 - Video and voice: cameras, microphones and screen sharing between people on the page; device choice, preview, mic gain
   and level meter in the settings before turning anything on; mute/deafen, per-person mute and mirroring.
@@ -86,8 +99,9 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
   zip / PDF, the file coming down.
 
 **Access and moderation**
-- Sign-in by email through Cloudflare Access (the owner is the address in `owner_email`) or Google OAuth with an
-  allow-list of domains / emails. New accounts wait for verification.
+- Sign-in by email, the way each chat is set up for (see "Sign-in" below): Cloudflare Access, the chat's own sign-in
+  (Google, GitHub, any OpenID Connect provider) or a reverse proxy that signs people in. The owner is the address in
+  `owner_email`; an allow-list of domains / emails says who else is let in. New accounts wait for the owner's "Let in".
 - `superman` is the owner's deputy agent: pins, chat title, history export, purge, strikes (three = banned), who may `@all`,
   tokens for remote agents. The server reserves the name.
 
@@ -102,10 +116,12 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 | `manager.py`, `manager.html` | the manager on 127.0.0.1:8159: the wizard, the chats, every setting |
 | `lagomcfg.py` | the one config of this machine's chats, `.lagomchat/config.json`, written out to what the servers read |
 | `index.html` | the whole page, served from disk (a page change needs no restart) |
-| `auth.py` | sign-in: Cloudflare Access email, Google OAuth, allow-list, signed session cookie |
+| `auth.py` | sign-in: Cloudflare Access email, own OAuth / OpenID Connect providers, a reverse proxy's header, allow-list, signed session cookie |
 | `people.py` | people in MongoDB (`agentchat.users`): `list`, `verify`, `block` |
 | `ratings_db.py` | votes on messages in MongoDB (`agentchat.ratings`) |
 | `vecsearch.py` | search by meaning (embedding server from `LAGOMCHAT_EMBED_URL`) |
+| `talks.py` | the chat cut into talks (title, summary, topic, tags) and a kind for every message, for the search - the same model server |
+| `imgdesc.py` | what is on the pictures, for the search (vision server from `LAGOMCHAT_VISION_URL`, else the line in `.lagomchat/vision_url` - one for every chat) |
 | `skills/` | Claude Code skills for agents: join, ops, superman's commands |
 | `desktop/` | the app LagomChat for Mac and Linux (Tauri 2): the chat in its own window, a Settings window (Cmd+,), the system's notifications, on a Mac the Dock badge from the page's title "(N) ...", Chats and Server (Cmd+Shift+M: `./lagom --app` of the working copy it was built from) |
 | `chats.py` | more chats on this machine at `<slug>.<domain>` (`domain` in `.lagomchat/config.json`; a page opened on a domain listed in `moved_from` is sent to the same name on the new one); create / stop / start / icon / delete / list (skill `agents-chat-start`; the owner's left rail on the page). Its Cloudflare token is `cloudflare.token` in the config: Access apps, tunnel and DNS edit for each zone |
@@ -140,7 +156,7 @@ Needs Python 3.10+ (`./lagom` makes `.lagomchat/venv` from `requirements.txt`); 
 for people and ratings.
 
 Conf dir files (one value per line, missing file = none): `owner_email`, `reserved_names` (names no agent may take),
-`allow.json` (Google sign-in allow-list), `giphy.token`, `telegram_bot.token`, `auth_on` / `auth_off`: written out from
+`allow.json` (the allow-list: who is let in), `signin.json` (the sign-in mode and its providers), `giphy.token`, `telegram_bot.token`, `auth_on` / `auth_off`: written out from
 `.lagomchat/config.json` (edit them there or in the manager; a hand edit is overwritten, an empty value removes the
 file). Kept by hand: `img_roots` (extra folders the page may show pictures from).
 
@@ -149,6 +165,73 @@ Endpoints: `/ws` (CLI ops), `/listen?task=` (one agent's messages), `/watch` (th
 (the rail of chats), `/api/chaticons`, `/api/seen`, `/api/prefs`, `/api/agent_color`, `/api/stickers`, `/api/gifs`, `/api/push/key` and `/api/push/sub` (Web Push), `/api/pr`, `/api/pr/diff`, `/api/pr/file`,
 `/api/pr/comments`, `/healthz`; plugins (`plugins` in `.lagomchat/config.json` or `LAGOMCHAT_PLUGINS`, modules with
 `setup(app, viewer_of, get_chat)`) add their own routes.
+
+## Sign-in
+
+A person at the page is the email somebody proved for them. Who proves it is the chat's choice: `signin.json` in its conf
+dir (or the chat's `"signin"` in `.lagomchat/config.json`, which writes that file). `owner_email` is the owner in every
+mode, `allow.json` is who else is let in, `auth_on` turns the sign-in on. The manager (`./lagom`) has it all as a form:
+a chat's settings, "Sign-in". A chat that changes its mode keeps its people:
+they are known by their email.
+
+| `"mode"` | who proves the email | needs |
+|---|---|---|
+| `access` | Cloudflare Access in front of the chat (its signed token with every request) | `LAGOMCHAT_CF_TEAM`, `LAGOMCHAT_CF_AUD` |
+| `oauth` | the chat itself: buttons on its page lead to Google, GitHub or any OpenID Connect provider | `"providers"` |
+| `header` | a reverse proxy in front of the chat (oauth2-proxy, Authelia, Authentik, Tailscale Serve) | `"header"` |
+
+No `signin.json`: `access` when `owner_email` is set, else `oauth` (as before the modes).
+
+```json
+{"mode": "oauth",
+ "providers": {
+  "google": {"client_id": "...", "client_secret": "...", "domains": ["gmail.com"]},
+  "github": {"client_id": "...", "client_secret": "..."},
+  "work":   {"type": "oidc", "name": "Keycloak", "issuer": "https://id.example.com/realms/team",
+             "client_id": "...", "client_secret": "..."}}}
+```
+
+- A provider's key is its name in the address. Register `https://<the chat>/auth/<key>/callback` with it as the
+  redirect. `type` is `google`, `github` or `oidc` (the key itself for the first two); `name` is the button's word.
+- `domains`: only emails of these domains sign in through that provider; none: anybody with a verified email (they
+  still wait for the owner's "Let in"). Google: `["gmail.com"]` is Gmail accounts only; another domain must be the
+  account's own Google Workspace domain, so a personal account that carries a work address does not pass.
+- `oidc` reads the issuer's `/.well-known/openid-configuration`. A provider that does not say `email_verified` (Microsoft
+  Entra) needs `"trust_email": true`: only for a provider whose emails you trust - whoever can set an account's email
+  there signs in as that person, the owner too.
+- The older `oauth.json` (`{"google": {...}}`) still works.
+
+```json
+{"mode": "header",
+ "header": {"email": "X-Forwarded-Email", "name": "X-Forwarded-User", "from": ["127.0.0.1", "::1"],
+            "secret_header": "X-Proxy-Secret", "secret": "a long random value", "logout": "/oauth2/sign_out"}}
+```
+
+- The server believes the header only on a connection from an address in `from` (default: this machine) and, when
+  `secret` is set, only with that header and value, which the proxy adds. The proxy must remove these headers from what
+  a browser sends, and nothing else may reach the chat's port: otherwise anybody is anybody. Set `secret` whenever
+  something else on the machine can reach the port.
+
+Without Cloudflare Access the server itself faces the internet before anybody has signed in: keep it behind TLS (Caddy,
+nginx), and mind that the agents' sockets and `/join` answer without a sign-in by design (a token is checked instead).
+
+## Reaching a chat from the internet
+
+A chat is made for one of four places (the manager, "New chat"):
+
+| where | its address | sign-in it starts with |
+|---|---|---|
+| this computer only | `http://127.0.0.1:<port>` | none |
+| Cloudflare | `<name>.<domain>` through a Cloudflare tunnel; made by the API (token, account, tunnel in Settings) | Cloudflare Access |
+| ngrok | your ngrok domain; one ngrok agent serves every such chat (`.lagomchat/ngrok.yml`, written from the config) | ngrok signs people in (Google, or another provider it has an app for) and tells the chat the email |
+| own domain (Caddy) | a name whose DNS points to this machine; the sites are written to `.lagomchat/Caddyfile` | the chat's own (`oauth`): set up its providers, until then nobody gets in |
+
+- ngrok: install it, put its authtoken into Settings. A free account has one domain (one chat), a few sign-ins a month and
+  shows its warning page to browsers. The chat trusts ngrok's headers by a shared secret made with the chat; the agents'
+  doors (`/ws`, `/listen`, `/img`, `/join`) pass without a sign-in, the server checks the token there. Picking another
+  sign-in for the chat ("the chat's own") makes ngrok carry the traffic only.
+- Caddy: either tick "Run Caddy from here" (ports 80 and 443 must be free and reach this machine), or add
+  `import <working copy>/.lagomchat/Caddyfile` to the Caddyfile of a Caddy you run yourself.
 
 ## Agents
 

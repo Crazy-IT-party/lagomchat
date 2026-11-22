@@ -9,6 +9,15 @@ setting of .lagomchat/config.json, written out to the servers on Save (lagomcfg.
     manager.py              serve, open the page in the browser (or only the page, if a manager is up already)
     manager.py --no-open    serve, do not open the browser
     manager.py --app        for the LagomChat app: a manager in the background if none is up; prints its address
+
+The same from the command line (./lagom <command>), no page needed:
+
+    status                  the chats (running or not, which need a restart for newer code) and the manager's address
+    stop [<chat> ...]       stop the named chats; none named: every chat, ngrok / Caddy and the manager - the whole setup
+    start [<chat> ...]      start the named chats; none named: what the last `stop` stopped (or every chat) and the manager
+    restart [<chat> ...]    restart the named chats; none named: every running one, the main chat last
+    clone <folder>          another setup from scratch: this code in <folder> with nothing of this one's chats and settings
+    help                    this text
 """
 from __future__ import annotations
 
@@ -102,7 +111,7 @@ def serve(open_browser: bool) -> None:
             t = L._read(Path(ch.get("data") or "/nonexistent") / "title.txt")
             if t:
                 ch["title"] = t
-        return {"config": c, "chats": L.status(c), "platform": "mac" if L.MAC else "linux", "config_file": str(L.CFG),
+        return {"config": c, "chats": L.status(c), "fronts": L.fronts(c), "platform": "mac" if L.MAC else "linux", "config_file": str(L.CFG),
                 "repo": str(HERE), "cloudflare_ready": bool(c["cloudflare"].get("token") and c["cloudflare"].get("account")
                                                             and c["cloudflare"].get("tunnel") and c.get("domain"))}
 
@@ -125,7 +134,8 @@ def serve(open_browser: bool) -> None:
                 Path(ch["data"]).mkdir(parents=True, exist_ok=True)
                 (Path(ch["data"]) / "title.txt").write_text(ch["title"])
             o = old["chats"][s]
-            if ch["port"] != o["port"] and ch.get("host") and not ch["host"].startswith("127."):
+            ch["via"] = o.get("via") or ""               # how a chat is reached is set when it is made
+            if ch["port"] != o["port"] and L.via(ch) == "cloudflare":
                 import chats as cz
                 cz.cf_route(ch["host"], ch["port"])
             if ch.get("host", "").startswith("127."):
@@ -158,7 +168,7 @@ def serve(open_browser: bool) -> None:
         elif op == "restart":
             L.service(slug, ch, "restart")
         elif op == "delete":
-            if ch.get("host") and not ch["host"].startswith("127."):
+            if L.via(ch) == "cloudflare":
                 import chats as cz
                 return cz.delete(slug)
             return L.delete_local(c, slug)
@@ -191,6 +201,8 @@ def serve(open_browser: bool) -> None:
             if not out.get("ok"):
                 raise L.Fail(out.get("error") or r.stderr[-300:] or "chats.py create failed")
             return out["result"]
+        if q.get("where") in ("ngrok", "caddy"):
+            return L.create_remote(c, q.get("title") or "", q.get("slug") or "", q["where"], q.get("host") or "")
         return L.create_local(c, q.get("title") or "", q.get("slug") or "")
 
     async def api_new(req):
@@ -231,19 +243,183 @@ def serve(open_browser: bool) -> None:
     web.run_app(app, host="127.0.0.1", port=port, print=None)
 
 
+# ---------------------------------------------------------------- the commands of ./lagom
+MANAGER_JOB = "game.lagom.manager"                   # a LaunchAgent somebody made for this manager (a Mac): stopped and started as that
+STOPPED = L.CFG_DIR / "stopped.json"                 # what `stop` stopped, for `start`
+
+
+def _job_file() -> Path | None:
+    """the manager's LaunchAgent, if there is one and it is this working copy's"""
+    f = L.LAUNCH / f"{MANAGER_JOB}.plist"
+    try:
+        import plistlib
+        args = plistlib.loads(f.read_bytes()).get("ProgramArguments") or []
+        return f if L.MAC and any(Path(x).resolve().parent == HERE for x in args if "/" in str(x)) else None
+    except (OSError, ValueError):
+        return None
+
+
+def manager_stop() -> str:
+    job, st = _job_file(), _up()
+    if job and L._run("launchctl", "print", f"gui/{os.getuid()}/{MANAGER_JOB}").returncode == 0:
+        L._run("launchctl", "bootout", f"gui/{os.getuid()}/{MANAGER_JOB}")
+        return "stopped (its LaunchAgent is unloaded until `./lagom start` or the next login)"
+    if st and st.get("pid"):
+        try:
+            os.kill(int(st["pid"]), 15)
+            return "stopped"
+        except (OSError, ValueError) as e:
+            return f"not stopped: {e}"
+    return "was not running"
+
+
+def _spawn(secs: float = 15) -> dict | None:
+    """the manager as a process of its own, waited for -> its state, None: it did not come up"""
+    L.CFG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log = open(L.CFG_DIR / "manager.log", "a")
+    subprocess.Popen([sys.executable, __file__, "--no-open"], stdout=log, stderr=log, start_new_session=True, cwd=HERE)
+    return _wait_up(secs)
+
+
+def _wait_up(secs: float) -> dict | None:
+    end = time.time() + secs
+    while time.time() < end:
+        time.sleep(0.25)
+        st = _up()
+        if st:
+            return st
+    return None
+
+
+def manager_start() -> str:
+    if _up():
+        return "runs already"
+    job = _job_file()
+    if job:
+        L._run("launchctl", "bootstrap", f"gui/{os.getuid()}", str(job))
+    return "started" if (_wait_up(10) if job else _spawn(10)) else "did not start: see .lagomchat/manager.log"
+
+
+def _aux_services() -> list[str]:
+    return [k for k in ("ngrok", "caddy") if L.service_file(k, {"service": L.aux_name(k)}).exists()]
+
+
+def _picked(c: dict, names: list[str]) -> list[str]:
+    bad = [n for n in names if n not in c["chats"]]
+    if bad:
+        raise L.Fail(f"no chat {', '.join(bad)}: `./lagom status` lists them")
+    return names
+
+
+def command(cmd: str, names: list[str]) -> int:
+    c = L.load()
+    last = lambda slugs: sorted(slugs, key=lambda s: bool(c["chats"][s].get("main")))     # the main chat last
+    if cmd == "status":
+        st = _up()
+        rows = L.status(c)
+        for x in rows:
+            print(f"{'*' if x['main'] else ' '} {x['slug']:<22} {'running' if x['running'] else 'stopped':<8} :{x['port']:<6}"
+                  f"{'needs a restart (older code)  ' if x.get('stale') else ''}{x['url']}  {x['title']}")
+        if not rows:
+            print("no chats yet: ./lagom opens the wizard")
+        for k in _aux_services():
+            print(f"  {k}: its service is installed")
+        print(f"manager: {'http://127.0.0.1:%s (./lagom opens it)' % st['port'] if st else 'not running'}")
+        print(f"setup: {L.CFG_DIR}")
+        return 0
+    if cmd == "stop":
+        whole = not names
+        slugs = [s for s in (_picked(c, names) or list(c["chats"])) if L.listening(c["chats"][s]["port"])]
+        if whole:                                        # for `start`: what ran
+            L.CFG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            STOPPED.write_text(json.dumps(slugs))
+        for s in last(slugs):
+            L.service(s, c["chats"][s], "stop")
+            print(f"{s}: {'stopped' if L.wait_port(c['chats'][s]['port'], False, 10) else 'STILL RUNNING'}", flush=True)
+        if whole:
+            for k in _aux_services():
+                L.service(k, {"service": L.aux_name(k)}, "stop")
+                print(f"{k}: stopped")
+            print(f"manager: {manager_stop()}")
+            if L.MAC:
+                print("The chats' addresses stay where they point (Cloudflare, DNS): they answer with an error until `./lagom start`. "
+                      "A login to this Mac starts the chats again by itself.")
+        elif not slugs:
+            print("nothing of that was running")
+        return 0
+    if cmd == "start":
+        whole = not names
+        if whole:
+            try:
+                want = [s for s in json.loads(STOPPED.read_text()) if s in c["chats"]]
+            except (OSError, ValueError):
+                want = list(c["chats"])
+        else:
+            want = _picked(c, names)
+        L.apply(c)                                       # the services' files are there before they start
+        bad = 0
+        for k in (_aux_services() if whole else []):
+            L.service(k, {"service": L.aux_name(k)}, "start")
+            print(f"{k}: started")
+        for s in reversed(last(want)):                   # the main chat first
+            ch = c["chats"][s]
+            if L.listening(ch["port"]):
+                print(f"{s}: runs already")
+                continue
+            L.service(s, ch, "start")
+            up = L.wait_port(ch["port"], True, 20)
+            bad += not up
+            print(f"{s}: {'started' if up else 'DID NOT START: see ' + str(L.log_file(s, ch))}", flush=True)
+        if whole:
+            STOPPED.unlink(missing_ok=True)
+            print(f"manager: {manager_start()}")
+        return 1 if bad else 0
+    if cmd == "restart":
+        slugs = _picked(c, names) or [s for s in c["chats"] if L.listening(c["chats"][s]["port"])]
+        L.apply(c)
+        bad = 0
+        for s in last(slugs):
+            ch = c["chats"][s]
+            L.service(s, ch, "restart")
+            time.sleep(1)
+            up = L.wait_port(ch["port"], True, 25)
+            bad += not up
+            print(f"{s}: {'restarted' if up else 'DID NOT COME BACK: see ' + str(L.log_file(s, ch))}", flush=True)
+        return 1 if bad else 0
+    if cmd == "clone":
+        if len(names) != 1:
+            raise L.Fail("./lagom clone <folder>: where the other setup goes")
+        dst = Path(names[0]).expanduser().resolve()
+        if dst.exists() and any(dst.iterdir()):
+            raise L.Fail(f"{dst} is there already and not empty")
+        r = subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", str(HERE), str(dst)], capture_output=True, text=True)
+        if r.returncode:
+            raise L.Fail(f"git clone failed: {r.stderr.strip()[-300:]}")
+        dirty = subprocess.run(["git", "-C", str(HERE), "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True).stdout.strip()
+        print(f"Another setup is in {dst}: this code as committed, none of this one's chats or settings.")
+        if dirty:
+            print("Changes here that are not committed did not go with it.")
+        print(f"Start it:  cd {dst} && ./lagom\n"
+              "Both on one machine share ~/.config/agentchat-chats (the domains, the list for the rail) and the ports 8170-8199:\n"
+              "the one saved last writes that folder; give the other setup another domain only if this one is stopped.")
+        return 0
+    raise L.Fail(f"no command {cmd!r}: ./lagom help")
+
+
 def main() -> None:
     a = sys.argv[1:]
+    words = [x for x in a if not x.startswith("-")]
+    if words or "-h" in a or "--help" in a:
+        if not words or words[0] == "help":
+            print(__doc__)
+            return
+        try:
+            raise SystemExit(command(words[0], words[1:]))
+        except L.Fail as e:
+            raise SystemExit(f"lagom: {e}")
     st = _up()
     if "--app" in a:
-        if not st:
-            L.CFG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            log = open(L.CFG_DIR / "manager.log", "a")
-            subprocess.Popen([sys.executable, __file__, "--no-open"], stdout=log, stderr=log, start_new_session=True, cwd=HERE)
-            for _ in range(60):
-                time.sleep(0.25)
-                st = _up()
-                if st:
-                    break
+        st = st or _spawn()
         if not st:
             raise SystemExit("lagom: the manager did not start, see .lagomchat/manager.log")
         up = [x for x in L.status(L.load()) if x["running"]]

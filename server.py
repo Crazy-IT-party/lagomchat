@@ -35,6 +35,7 @@ import bisect
 import fcntl
 import hashlib
 import importlib
+from email.utils import formatdate, parsedate_to_datetime
 import json
 import math
 import os
@@ -63,7 +64,11 @@ sys.path.insert(0, str(HERE))
 from agentchat import GH, PR_FIELDS, _front, claude_usage, frame, line, pr_summary, proc_start  # noqa: E402
 from ratings_db import RatingsDB  # noqa: E402
 import auth  # noqa: E402
+import tgimport  # noqa: E402
+import imimport  # noqa: E402
 from vecsearch import VecIndex  # noqa: E402
+from imgdesc import Down as VisionDown, ImgDesc, KINDS as PIC_KINDS  # noqa: E402
+import talks as talks_mod  # noqa: E402
 
 PORT = int(os.environ.get("LAGOMCHAT_PORT", "8150"))
 PEOPLE_KINDS = ("pjoin", "pleft", "kstati", "remind")      # a person came / went, a reminder (kstati: the facts of old logs, not shown): lines of the log for the page only
@@ -87,6 +92,19 @@ ALL_RE = re.compile(r"(?<![\w@])@all(?![\w-])", re.I)     # @all: everybody (the
 THUMB_UP, THUMB_DOWN = "\U0001F44D", "\U0001F44E"   # a reaction of these is a vote, and a vote is a reaction (the owner, #1974)
 HERE_GRACE = 180.0          # s: a person back within this is the same stay (a reload, a redeploy of the chat)
 DEPUTY = {"superman"}      # the owner's deputy in the chat (the owner, 2026-10-31): one at a time, its word is the owner's for housekeeping
+PIC_RE = re.compile(r"(?:/[\w.\-]+)+\.(?:png|jpe?g|gif|webp)", re.I)     # a picture's path in a message
+
+
+def _install_file(name: str) -> Path | None:
+    """a file of the whole install (.lagomchat/<name> of the working copy): one setting for every chat; None for a chat run by
+    hand with no install around it"""
+    try:
+        import lagomcfg
+        return lagomcfg.CFG_DIR / name
+    except Exception:
+        return None
+
+
 REPLAY = 50                # at most this many missed events replayed to a listener
 # what reaches an agent's listener and when (token economy, the owner 2026-10-29: every delivery is a turn of that agent):
 #   wake  - to it, @it, a reply to it, anything from the owner: sent after WAKE_DELAY s (a burst goes as one)
@@ -331,6 +349,15 @@ class Chat:
         except (OSError, ValueError):
             self.meta = {}
         self.vec = VecIndex(DATA)                      # the search by meaning (vecsearch.py)
+        # what is on the pictures (imgdesc.py; the owner, #3177): a model on the lab's GPU describes them, the search reads that
+        self.img = ImgDesc(DATA, _install_file("vision_url"))
+        self.pvec = VecIndex(DATA, "pvec")             # the pictures' descriptions by meaning, by the id of their message
+        self.pics: dict[int, list[str]] = {}           # message id -> the pictures it names
+        self.pic_ids: dict[str, set[int]] = {}         # picture -> the messages that name it
+        self.pic_text: dict[int, str] = {}             # message id -> what the search reads of its pictures
+        # the chat as talks, and a kind for every message (talks.py; the owner, #3186): the same model reads them
+        self.talks = talks_mod.Talks(DATA, self.img.url)
+        self.tvec = VecIndex(DATA, "tvec")             # the talks' titles and summaries by meaning, by their first message's id
         self.rdb = RatingsDB(DATA)                      # the ratings in MongoDB (ratings_db.py)
         # what a person writes in another language than English / Russian: an agent (superman, or a translator) puts the English text under it
         self.trans_file = DATA / "translations.jsonl"
@@ -616,15 +643,69 @@ class Chat:
             e = dict(e, reply={"id": r["id"], "agent": r["agent"], "text": "(a message from before you came)"})
         return e
 
+    def pics_of(self, e: dict) -> list[str]:
+        """note the pictures a message names (again after an edit); returns the ones not looked at by the model yet"""
+        i = e["id"]
+        for p in self.pics.pop(i, ()):
+            self.pic_ids.get(p, set()).discard(i)
+        self.pic_text.pop(i, None)
+        if e["kind"] != "msg" or i in self.deleted:
+            return []
+        ps = list(dict.fromkeys(PIC_RE.findall(e.get("text") or "")))[:20]
+        if not ps:
+            return []
+        self.pics[i] = ps
+        for p in ps:
+            self.pic_ids.setdefault(p, set()).add(i)
+        self.pic_said(i)
+        return [p for p in ps if p not in self.img.d]
+
+    def pic_said(self, i: int) -> None:
+        """what the search reads of a message's pictures, from what the model has said so far"""
+        t = " ".join(x for x in (self.img.text(p) for p in self.pics.get(i, ())) if x)
+        if t:
+            self.pic_text[i] = t
+        else:
+            self.pic_text.pop(i, None)
+
+    def pic_views(self, text: str) -> dict:
+        """{path: {en, ru, text, kind, tags}} of the pictures a text names: the page shows it under a found picture"""
+        out = {}
+        for p in PIC_RE.findall(text or "") if self.img.d else ():
+            r = self.img.get(p)
+            if r:
+                out[p] = {k: r[k] for k in ("en", "ru", "text", "kind", "tags")}
+        return out
+
     def visible_paths(self, start: int) -> set[str]:
         """the picture paths named in the events a person may see"""
-        pat = re.compile(r"(?:/[\w.\-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|m4a|wav)", re.I)
         out: set[str] = set()
         for e in self.events:
             v = self.view_for(e, start, "verified")                  # what they see: not the quoted start of an earlier message
             if v:
-                out.update(pat.findall(v.get("text") or ""))
+                out.update(MEDIA_PATH_RE.findall(v.get("text") or ""))
         return out
+
+    def take_in(self, evs: list[dict], reacts: dict) -> int:
+        """the messages of an import (tgimport.py; their ids count from 0) join the log under the chat's next ids, with the time
+        they were sent at. No listener is woken by them: the agents' place in the log moves past. Returns the first id"""
+        base = self.next_id
+        with self.jsonl.open("a") as f, self.txt.open("a") as g:
+            for e in evs:
+                e["id"] += base
+                if e.get("reply"):
+                    e["reply"]["id"] += base
+                self.events.append(e)
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                g.write(line(e) + "\n")
+        self.next_id = base + len(evs)
+        self.next_id_file.write_text(str(self.next_id))
+        if reacts:
+            self.reacts.update({base + int(i): r for i, r in reacts.items()})
+            self.reacts_file.write_text(json.dumps(self.reacts, ensure_ascii=False))
+        for t in self.delivered:
+            self.delivered[t] = self.next_id - 1
+        return base
 
     def reply_ref(self, rid, min_id: int = 0) -> dict | None:
         """a reply's pointer: the message it answers (its id, its author, a short start of its text)"""
@@ -882,6 +963,9 @@ class Chat:
             f.write(json.dumps({"id": mid, "ts": now, "text": text, "was": e["text"]}, ensure_ascii=False) + "\n")
         e["text"], e["edited"] = text, now
         await asyncio.to_thread(self.vec.drop, {mid})            # the search by meaning takes the new text in
+        await asyncio.to_thread(self.pvec.drop, {mid})
+        await self.talks_forget({mid})
+        self.pics_of(e)
         m = json.dumps({"type": "edit", "id": mid, "text": text, "edited": now}, ensure_ascii=False)
         for ws in list(self.watchers):
             v = self.viewers.get(ws) or {"role": "owner", "id": ""}
@@ -918,20 +1002,22 @@ class Chat:
                 await send(ws, json.dumps({"type": "views", "v": cnt, **({"mine": new} if str(self.rater_of(v)["id"]) == rid else {})}))
 
     async def delete(self, mid: int) -> None:
+        """the owner takes a line out of the chat: anybody's message, his own, a line of the chat itself (joined, left, a reminder).
+        Nothing is written about it (the owner, #3362): no word to the agents, and the page shows no mark where it was"""
         e = next((x for x in self.events if x["id"] == mid), None)
-        if not e or e["kind"] != "msg" or str(e["task"]).startswith("user") or mid in self.deleted:
+        if not e or mid in self.deleted:
             return
         self.deleted.add(mid)
         now = round(time.time(), 3)
         with self.deleted_file.open("a") as f:
             f.write(json.dumps({"id": mid, "ts": now, "rater": RATER}) + "\n")
-        msg, agent = self.rated(e)
-        await self.to_mongo({"id": mid, "set": {"deleted": {"by": RATER, "ts": now}}, "insert": {"message": msg, "agent": agent}})
+        if e["kind"] == "msg" and not str(e["task"]).startswith("user"):       # the ratings' database is of the agents' messages
+            msg, agent = self.rated(e)
+            await self.to_mongo({"id": mid, "set": {"deleted": {"by": RATER, "ts": now}}, "insert": {"message": msg, "agent": agent}})
         await self.watch_all({"type": "del", "id": mid})
-        pre = " ".join(e["text"].split())[:100]
-        who = [e["agent"]] + [n for n in (e.get("to") or []) if n not in (e["agent"], USER["name"])]
-        await self.post("msg", USER, f"CANCEL: I deleted the message #{mid} of {e['agent']} (\"{pre}...\"). Stop everything that was "
-                        f"started because of it, undo what you can, and tell me in one line what you stopped.", who, ref=mid)
+        if e["kind"] == "msg":
+            await self.talks_forget({mid})
+        print(f"[del] #{mid} ({e['kind']} of {e.get('agent')})", flush=True)
 
     def purge_plan(self, since: float, till: float, from_id: int, till_id: int) -> tuple[list[dict], int]:
         """(the events to take out, how many in the span stay): every line in the span, but for what a restart needs to rebuild
@@ -952,6 +1038,12 @@ class Chat:
         span = [e for e in self.events if hit(e)]
         out = [e for e in span if e["id"] not in keep]
         return out, len(span) - len(out)
+
+    async def talks_forget(self, ids: set[int]) -> None:
+        """a message purged, deleted or edited: the title and the summary written of its talk go too, and the talk is read anew"""
+        gone = self.talks.drop(ids)
+        if gone:
+            await asyncio.to_thread(self.tvec.drop, gone)
 
     async def purge(self, gone: list[dict], by: str) -> str:
         """take the events out of the log, for good on the page and in the search; the lines go to purged/<time>.jsonl first. The path"""
@@ -980,8 +1072,13 @@ class Chat:
         for t, evs in self.pend.items():
             self.pend[t] = [e for e in evs if e["id"] not in ids]
         await asyncio.to_thread(self.vec.drop, ids)
+        await asyncio.to_thread(self.pvec.drop, ids)
+        await self.talks_forget(ids)
         for i in ids:
             self.views.pop(i, None)
+            self.pic_text.pop(i, None)
+            for p in self.pics.pop(i, ()):
+                self.pic_ids.get(p, set()).discard(i)
         await self.watch_all({"type": "purged", "ids": sorted(ids), "first": self.events[0]["id"] if self.events else 0})
         if any(p["id"] in ids for p in self.pins):
             self.pins = [p for p in self.pins if p["id"] not in ids]
@@ -1084,7 +1181,7 @@ class Chat:
             self.agent_run, self.agent_paused = 0, False         # a person spoke: the agents' count starts again (#2285)
         if kind == "msg" and a["task"] == "user":
             await self.clear_waiting(e)                          # the owner answered an agent that was waiting for him
-            if KNOCKS and e.get("reply"):
+            if (KNOCKS or GUESTS) and e.get("reply"):
                 await knock_answer(e)
         if cleared:
             await self.watch_all({"type": "agents", "agents": self.roster()})
@@ -1528,9 +1625,9 @@ async def op(q: dict, ws) -> dict:
             data = base64.b64decode(q.get("data") or "", validate=True)
         except ValueError:
             return {"ok": False, "error": "upload: data is not base64"}
-        magic = {**UP_MAGIC, ".mp4": None, ".m4v": None, ".mov": None, ".webm": b"\x1a\x45\xdf\xa3"}
+        magic = {**UP_MAGIC, ".mp4": None, ".m4v": None, ".mov": None, ".webm": b"\x1a\x45\xdf\xa3", ".pdf": b"%PDF-"}
         if ext not in magic:
-            return {"ok": False, "error": "upload: png, jpeg, gif, webp, mp4, m4v, mov or webm only"}
+            return {"ok": False, "error": "upload: png, jpeg, gif, webp, mp4, m4v, mov, webm or pdf only"}
         if len(data) > MAX_AGENT_UPLOAD:
             return {"ok": False, "error": f"upload: over {MAX_AGENT_UPLOAD >> 20} MB"}
         good = data[4:8] == b"ftyp" if magic[ext] is None else data.startswith(magic[ext]) and (ext != ".webp" or data[8:12] == b"WEBP")
@@ -1584,7 +1681,7 @@ async def op(q: dict, ws) -> dict:
             lst = set(a[key])
             (lst.add if act == "add" else lst.discard)(val)
             a[key] = sorted(lst)
-            auth.save_allow(a)
+            allow_save(a)
             _ROLE_CACHE.clear()
             print(f"[allow] {act} {what} {val}", flush=True)
         return {"ok": True, "allow": a, "providers": sorted(auth.oauth_conf())}
@@ -1805,6 +1902,42 @@ async def op(q: dict, ws) -> dict:
         a["waiting"] = {"text": " ".join(text.split())[:140], "id": e["id"], "since": e["ts"]}
         await chat.watch_all({"type": "agents", "agents": chat.roster()})
         return {"ok": True, "id": e["id"]}
+    if kind == "confirm":
+        # a critical action waits for the owner's own yes (the owner, #3057): his page shows Confirm / Refuse; the pick is taken only
+        # from a page whose sign-in is proven at the moment of the click (confirm_pick), and the answer carries `confirmed`, a field
+        # no typed message can have. The agent asks the server itself what was picked: agentchat confirmed <id>
+        if not text.strip():
+            return {"ok": False, "error": 'agentchat confirm "<what exactly will be done>"'}
+        e = await chat.post("msg", a, text[:1200], [USER["name"]], confirm=True)
+        a["waiting"] = {"text": " ".join(text.split())[:140], "id": e["id"], "since": e["ts"]}
+        await chat.watch_all({"type": "agents", "agents": chat.roster()})
+        return {"ok": True, "id": e["id"], "ttl": CONFIRM_TTL}
+    if kind == "confirmed":
+        try:
+            cid = int(q.get("id") or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        qe = next((x for x in chat.events if x["id"] == cid and x.get("confirm")), None)
+        if not qe or qe["task"] != a["task"]:
+            return {"ok": False, "error": "no such question of yours"}
+        st, ans = confirm_state(qe)
+        return {"ok": True, "state": st, "text": qe["text"], "asked": qe["ts"], "at": ans["ts"] if ans else None, "answer": ans["id"] if ans else None}
+    if kind == "card":
+        # what a link's card says when the site tells a fetch nothing (the owner, #3068): a Claude artifact shows its title and
+        # first paragraph only to the signed-in, so an agent that can read it gives them; an empty title takes the card's words away
+        m = CA_RE.search(str(q.get("url") or ""))
+        if not m:
+            return {"ok": False, "error": 'agentchat card <https://claude.ai/artifact/...> "<title>" ["<the first paragraph>"]'}
+        title, desc = " ".join(text.split())[:120], " ".join(str(q.get("desc") or "").split())[:400]
+        if title:
+            CARDS["ca:" + m.group(1)] = {"title": title, "desc": desc, "by": a["name"], "ts": round(time.time())}
+        else:
+            CARDS.pop("ca:" + m.group(1), None)
+        while len(CARDS) > CARDS_MAX:                # every page gets them all: the oldest go
+            CARDS.pop(min(CARDS, key=lambda k: CARDS[k].get("ts", 0)))
+        CARDS_FILE.write_text(json.dumps(CARDS, ensure_ascii=False))
+        await chat.watch_all({"type": "cards", "cards": CARDS})
+        return {"ok": True, "n": len(CARDS)}
     if kind == "poll":                           # an agent's poll (the owner, #1386): the page shows the options to vote on
         opts = list(dict.fromkeys(" ".join(str(x).split())[:100] for x in (q.get("options") or []) if str(x).strip()))[:10]
         if not text.strip() or len(opts) < 2:
@@ -1858,7 +1991,61 @@ def from_proxy(req: web.Request) -> bool:
 # A token is a name: the server fills in the name and the task of whatever such a connection sends, so it can't speak for another
 # agent or take superman's name. Only the hash is kept. It sees the chat from the moment the token was made, not the old talk.
 TOKENS_FILE = auth.CONF / "agent_tokens.json"
-REMOTE_OPS = {"who", "remind", "log", "hello", "say", "doc", "upload", "turn", "meta", "bye", "inbox", "git", "usage", "ask", "poll", "pvote", "react",
+CA_RE = re.compile(r"https?://claude\.ai/(?:public/artifacts|artifact)/([\w-]{6,64})")
+CARDS_FILE = DATA / "cards.json"           # {"ca:<artifact id>": {title, desc, by, ts}}: the words agents gave the cards
+CARDS_MAX = 500
+try:
+    CARDS = {str(k): v for k, v in json.loads(CARDS_FILE.read_text()).items() if isinstance(v, dict)}
+except (OSError, ValueError, AttributeError):
+    CARDS = {}
+CONFIRM_TTL = 900                          # a question for the owner's yes is good for 15 minutes
+
+
+def confirm_state(qe: dict) -> tuple[str, dict | None]:
+    """a confirm question's state: yes / no (the owner's pick, taken by confirm_pick only), expired, wait"""
+    ans = next((x for x in chat.events if isinstance(x.get("confirmed"), dict) and x["confirmed"].get("id") == qe["id"]
+                and x["task"] == USER["task"] and x["id"] not in chat.deleted), None)
+    if ans:
+        return ("yes" if ans["confirmed"].get("ok") is True else "no"), ans
+    if qe["id"] in chat.deleted:
+        return "no", None
+    return ("expired" if time.time() - qe["ts"] > CONFIRM_TTL else "wait"), None
+
+
+def proven_owner(v: dict) -> bool:
+    """the owner by proof, not by default: sign-in is enforced, and Cloudflare Access signed this very email (a chat with the
+    sign-in off makes everybody the owner: such a page confirms nothing)"""
+    em = auth.owner_email()
+    return bool(em and auth.enforced() and v.get("role") == "owner" and v.get("signed") and v.get("em") == em
+                and v.get("id") and v["id"] == auth.owner_sid())
+
+
+async def confirm_pick(req: web.Request, me: dict, cid, ok) -> str:
+    """the owner's Confirm / Refuse on a question: who is at the page is asked again now (the token read anew, not the page's
+    role from when it opened); one answer per question, in time. Returns what is wrong, or "" """
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return "no such question"
+    if not isinstance(ok, bool):
+        return "no such question"
+    _CF_SEEN.pop(cf_token(req) or "", None)                  # not the answer of a minute ago
+    if not proven_owner(await _viewer_of(req)):
+        return "only the owner's signed-in page confirms"
+    qe = next((x for x in chat.events if x["id"] == cid and x.get("confirm") and x["kind"] == "msg"), None)
+    if not qe or cid in chat.deleted:
+        return "no such question"
+    st, _ = confirm_state(qe)
+    if st != "wait":
+        return "this question has expired" if st == "expired" else "this question is answered already"
+    who = (chat.agents.get(qe["task"]) or {}).get("name") or qe["agent"]
+    await chat.post("msg", {"name": me["name"], "task": USER["task"]}, "Confirmed" if ok else "Refused", [who], reply=chat.reply_ref(cid),
+                    confirmed={"id": cid, "ok": ok})
+    print(f"[confirm] #{cid} of {who}: {'yes' if ok else 'no'} by the owner@{me.get('ip')} via {me.get('via')}", flush=True)
+    return ""
+
+
+REMOTE_OPS = {"who", "remind", "log", "hello", "say", "doc", "upload", "turn", "meta", "bye", "inbox", "git", "usage", "ask", "confirm", "confirmed", "card", "poll", "pvote", "react",
               "translate", "status", "working", "pins"}
 REMOTE_WS: dict[str, set] = {}
 
@@ -1916,9 +2103,69 @@ def knocks_sweep() -> None:
 async def knock_answer(e: dict) -> None:
     """the owner's pick on a knock's question"""
     rid = (e.get("reply") or {}).get("id")
+    if e["text"] not in KNOCK_OPTS:
+        return
     k = next((k for k, v in KNOCKS.items() if v["ask"] == rid and v["state"] == "wait"), None)
-    if k and e["text"] in KNOCK_OPTS:
+    if k:
         KNOCKS[k]["state"] = "in" if e["text"] == KNOCK_OPTS[0] else "out"
+    em = next((k for k, v in GUESTS.items() if v["ask"] == rid and v["state"] == "wait"), None)
+    if em:
+        g = GUESTS[em]
+        g["state"] = "in" if e["text"] == KNOCK_OPTS[0] else "out"
+        if g["state"] == "in":
+            a = auth.allow_list()
+            a["google_emails"] = sorted({*a["google_emails"], em})
+            allow_save(a)
+            _ROLE_CACHE.clear()
+            print(f"[allow] add email {em} (let in from the page)", flush=True)
+            for ws in list(g["ws"]):                 # their waiting pages open the chat
+                try:
+                    await ws.send_str(json.dumps({"type": "gate", "state": "in"}))
+                except (ConnectionError, RuntimeError):
+                    pass
+        g["ws"].clear()
+
+
+def allow_save(a: dict) -> None:
+    """the chat's list of who may in, and the same into the manager's config: it writes allow.json out of it at every save"""
+    auth.save_allow(a)
+    try:
+        import lagomcfg
+        c = lagomcfg.load()
+        ch = next((x for x in c["chats"].values() if x.get("conf") and Path(x["conf"]).expanduser().resolve() == auth.CONF.resolve()), None)
+        if ch is not None:
+            ch["guests"] = {**(ch.get("guests") or {}), **a}
+            lagomcfg.save(c)
+    except (OSError, ValueError, KeyError) as x:
+        print(f"[allow] not written to the manager's config: {x!r}", flush=True)
+
+
+# A person who signed in and is not on the chat's list (the owner, #3341): the same question on the owner's page, once per email;
+# "Let in" puts the email on the list (allow.json), so nobody is added at Cloudflare by hand. A refused one is not asked about again
+GUESTS: dict[str, dict] = {}                      # email -> {ask, state: wait | in | out, at, ip, ws: the waiting pages}
+GUEST_TTL = 7 * 86400
+
+
+async def guest_knock(req: web.Request, me: dict, ws: web.WebSocketResponse) -> None:
+    em = str(me.get("em") or "").lower()
+    if not em or not auth.owner_email():
+        return
+    for k, v in list(GUESTS.items()):
+        if time.time() - v["at"] > GUEST_TTL:
+            del GUESTS[k]
+    ip = where_from(req)[0]
+    g = GUESTS.get(em)
+    if not g:
+        if sum(v["state"] == "wait" for v in GUESTS.values()) >= KNOCK_MAX or any(v["ip"] == ip and v["state"] != "in" for v in GUESTS.values()):
+            return                                # many wait already, or this address asked under another email: no new question
+        access_log(req, "guest-knock", em=em)
+        g = GUESTS[em] = {"ask": 0, "state": "wait", "at": time.time(), "ip": ip, "ws": set()}
+        e = await chat.post("msg", {"name": "LagomChat", "task": "knock"},
+                            f"A person asks in: {me.get('acct_name') or em.split('@')[0]} <{em}>. Let them in? They will see the chat from the moment they come in.",
+                            [USER["name"]], ask=KNOCK_OPTS)
+        g["ask"] = e["id"]
+    if g["state"] == "wait":
+        g["ws"].add(ws)
 
 
 async def join_knock(req: web.Request) -> web.Response:
@@ -1958,9 +2205,18 @@ async def join_knock(req: web.Request) -> web.Response:
     return web.json_response({"ok": True, "id": kid, "wait": KNOCK_TTL})
 
 
+def client_ip(req: web.Request) -> str:
+    """the address a request came from. A proxy on this machine (cloudflared, ngrok, Caddy) adds the address it saw last to
+    X-Forwarded-For: that one, not the ones before it and not CF-Connecting-IP, which anybody can send. A connection from
+    elsewhere is its own address, whatever its headers say"""
+    peer = req.remote or "?"
+    fwd = (req.headers.get("X-Forwarded-For") or "").rsplit(",", 1)[-1].strip()
+    return fwd[:64] if fwd and peer in ("127.0.0.1", "::1") else peer
+
+
 def where_from(req: web.Request) -> tuple[str, str]:
     """the address and, when Cloudflare's visitor location headers are on, the city; no outside service gets the address"""
-    ip = req.headers.get("CF-Connecting-IP") or (req.remote or "?")
+    ip = client_ip(req)
     city = req.headers.get("CF-IPCity") or ""
     try:
         city = city.encode("latin-1").decode("utf-8")     # Cloudflare sends UTF-8, aiohttp reads it as latin-1
@@ -2016,11 +2272,10 @@ def remote_view(q: dict, r: dict, tok: dict) -> dict:
 
 def remote_paths(tok: dict) -> set[str]:
     """the pictures a token may fetch: named in the others' messages since the token, not in its own (a path it wrote proves nothing)"""
-    pat = re.compile(r"(?:/[\w.\-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|m4a|wav)", re.I)
     out: set[str] = set()
     for e in chat.events:
         if e["id"] >= tok["since"] and e.get("task") != tok["task"]:
-            out.update(pat.findall(e.get("text") or ""))
+            out.update(MEDIA_PATH_RE.findall(e.get("text") or ""))
     return out
 
 
@@ -2189,9 +2444,10 @@ async def email_session(req: web.Request) -> dict | None:
 async def _viewer_of(req: web.Request) -> dict:
     """who is at this page: {role, name, id, task, avatar, enforced}; with sign-in not enforced everybody is the owner as before"""
     enforced = auth.enforced()
-    owner_em = auth.owner_email()                        # sign-in by email only (the owner, 2026-11-06): another cookie counts for nothing
-    sess = await email_session(req) if owner_em else session_of(req)
-    role = "owner" if owner_em and sess and sess["em"] == owner_em else await role_of(sess["sid"]) if sess else ""
+    owner_em = auth.owner_email()
+    mode = auth.mode()                                   # one source of the email per chat: another one's cookie or header counts for nothing
+    sess = await email_session(req) if mode == "access" else auth.header_identity(req.remote or "", req.headers) if mode == "header" else session_of(req)
+    role = "owner" if owner_em and sess and sess.get("em") == owner_em else await role_of(sess["sid"]) if sess else ""
     if role == "pending" and auth.allowed(sess):
         role = "verified"                                # on the allow-list (a Google domain or email; #1497)
     if role == "owner" or (not enforced and role in ("", "pending")):
@@ -2200,7 +2456,7 @@ async def _viewer_of(req: web.Request) -> dict:
     if role == "verified":
         return {"role": "verified", "name": human_name(sess), "id": sess["sid"], "em": sess.get("em", ""), "task": "user:" + sess["sid"], "avatar": sess.get("avatar", ""),
                 "signed": True, "enforced": enforced, "acct_name": sess.get("name", "")}
-    return {"role": role or "none", "name": (sess or {}).get("name", ""), "id": (sess or {}).get("sid", ""), "task": "", "avatar": (sess or {}).get("avatar", ""),
+    return {"role": role or "none", "name": (sess or {}).get("name", ""), "id": (sess or {}).get("sid", ""), "em": (sess or {}).get("em", ""), "task": "", "avatar": (sess or {}).get("avatar", ""),
             "signed": bool(sess), "enforced": enforced, "acct_name": (sess or {}).get("name", "")}
 
 
@@ -2299,7 +2555,7 @@ async def api_display_name(req: web.Request) -> web.Response:
     # browser used it - through a proxy X-Forwarded-Host (the owner, #1252: Save did nothing behind a proxy)
     org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
     same = urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"
-    print(f"[name] {v.get('task')}@{req.headers.get('CF-Connecting-IP') or req.remote}: origin={org} host={host} -> {'ok' if same else 'refused'}", flush=True)
+    print(f"[name] {v.get('task')}@{client_ip(req)}: origin={org} host={host} -> {'ok' if same else 'refused'}", flush=True)
     if not same:
         return web.json_response({"ok": False, "error": f"refused: the page's origin {org or '-'} is not {host}"}, status=403)
     try:
@@ -3007,6 +3263,8 @@ async def api_chats(req: web.Request) -> web.Response:
         tmp = None
         if op == "create":
             args = ["create", str(q.get("title") or "")[:60], slug]
+            if str(q.get("import") or "").strip():           # a Telegram export to bring into the new chat
+                args += ["--import", str(q["import"]).strip()[:1000]]
         elif op == "icon" and slug:                      # the round icon on the rail (the owner, #1349): monogram, colour, picture
             args = ["icon", slug]
             if "text" in q or "color" in q:              # the icon's editor sends both; the background alone leaves them as they are
@@ -3303,7 +3561,7 @@ async def api_seen(req: web.Request) -> web.Response:
     """the last message id read in this chat, by the person's email, for the other chats' circles (the owner, #1860)"""
     v = await viewer_of(req)
     em = str(v.get("em") or "").lower()
-    if not em:
+    if not em or v["role"] not in ("owner", "verified"):       # one who waits to be let in writes nothing
         return web.json_response({"ok": False}, status=401)
     try:
         q = await req.json()
@@ -3368,16 +3626,46 @@ async def need_viewer(req: web.Request) -> dict:
     return v
 
 
+_SIGNIN_HITS: dict[str, list[float]] = {}
+SIGNIN_PER_10MIN = 30
+
+
+def next_of(req: web.Request, prefix: str) -> str:
+    """where a sign-in goes when it is done: ?next when it is a path of this chat, else the chat's page (no other site)"""
+    nxt = req.query.get("next", "")
+    return nxt if nxt.startswith("/") and not nxt.startswith(("//", "/\\")) else prefix + "/"
+
+
+def signin_rate(req: web.Request) -> bool:
+    """the chat's own sign-in answers before anybody is known: an address begins or ends it 30 times in ten minutes, no more"""
+    ip, now = client_ip(req), time.time()
+    for k in [k for k, v in _SIGNIN_HITS.items() if not v or now - v[-1] >= 600]:
+        del _SIGNIN_HITS[k]
+    hits = [t for t in _SIGNIN_HITS.get(ip, []) if now - t < 600]
+    # all the addresses together are held to 30 times that
+    if len(hits) >= SIGNIN_PER_10MIN or sum(len(v) for v in _SIGNIN_HITS.values()) >= 30 * SIGNIN_PER_10MIN:
+        return False
+    _SIGNIN_HITS[ip] = hits + [now]
+    return True
+
+
 async def oauth_login(req: web.Request):
-    """/auth/google/login: to Google (the owner, 2026-11-03, #1497)"""
+    """/auth/<provider>/login: to the provider (Google: the owner, 2026-11-03, #1497; any: 2026-11-22)"""
     prov = req.match_info["prov"]
-    if prov not in auth.oauth_conf():
+    if auth.mode() != "oauth" or prov not in auth.oauth_conf():
         raise web.HTTPNotFound(text=f"{prov} sign-in is not set up")
+    if not signin_rate(req):
+        raise web.HTTPTooManyRequests(text="Too many sign-in attempts from this address. Try again in ten minutes.")
     scheme, host, prefix = origin_of(req)
-    nxt = req.query.get("next", prefix + "/")
-    if not nxt.startswith("/") or nxt.startswith("//"):
-        nxt = prefix + "/"
-    raise web.HTTPFound(auth.oauth_url(prov, f"{scheme}://{host}{prefix}/auth/{prov}/callback", auth.make_state(nxt)))
+    state, st = auth.make_state(next_of(req, prefix))
+    try:
+        url = await asyncio.to_thread(auth.oauth_url, prov, f"{scheme}://{host}{prefix}/auth/{prov}/callback", state, st)
+    except Exception as x:                               # an OpenID Connect issuer that does not answer
+        print(f"[auth] {prov} sign-in: the provider is not reachable: {x!r}", flush=True)
+        return web.Response(status=502, text=f"The {auth.provider_names().get(prov, prov)} sign-in is not reachable now. Try again later.", content_type="text/plain")
+    r = web.HTTPFound(url)
+    r.set_cookie(auth.STATE_COOKIE, st, max_age=900, path=prefix or "/", httponly=True, secure=scheme == "https", samesite="Lax")
+    raise r
 
 
 def cf_token(req: web.Request) -> str | None:
@@ -3387,9 +3675,7 @@ def cf_token(req: web.Request) -> str | None:
 async def cf_login(req: web.Request):
     """/auth/cf/login: in as the email Cloudflare Access proved (the owner, #1611)"""
     scheme, host, prefix = origin_of(req)
-    nxt = req.query.get("next", prefix + "/")
-    if not nxt.startswith("/") or nxt.startswith("//"):
-        nxt = prefix + "/"
+    nxt = next_of(req, prefix)
     em = await asyncio.to_thread(auth.cf_access_email, cf_token(req))
     if not em:
         print(f"[auth] cloudflare access sign-in refused: {auth.last_error}", flush=True)
@@ -3407,26 +3693,35 @@ async def cf_login(req: web.Request):
 async def oauth_callback(req: web.Request):
     prov = req.match_info["prov"]
     scheme, host, prefix = origin_of(req)
-    nxt = auth.read_state(req.query.get("state"))
-    if prov not in auth.oauth_conf() or not nxt or not req.query.get("code"):
+    st = req.cookies.get(auth.STATE_COOKIE)
+    nxt = auth.read_state(req.query.get("state"), st)
+    if auth.mode() != "oauth" or prov not in auth.oauth_conf() or not nxt or not req.query.get("code"):
         return web.Response(status=403, text="The sign-in was not confirmed (an old or forged link). Go back and try again.", content_type="text/plain")
-    who = await asyncio.to_thread(auth.oauth_identity, prov, req.query["code"], f"{scheme}://{host}{prefix}/auth/{prov}/callback")
+    if not signin_rate(req):
+        raise web.HTTPTooManyRequests(text="Too many sign-in attempts from this address. Try again in ten minutes.")
+    pname = auth.provider_names().get(prov, prov)
+    who = await asyncio.to_thread(auth.oauth_identity, prov, req.query["code"], f"{scheme}://{host}{prefix}/auth/{prov}/callback", st)
     if not who:
         print(f"[auth] {prov} sign-in refused: {auth.last_error}", flush=True)
-        return web.Response(status=403, text=f"The {prov.title()} sign-in was not confirmed. Go back and try again.", content_type="text/plain")
+        access_log(req, "signin-refused", prov=prov)
+        return web.Response(status=403, text=f"The {pname} sign-in was not confirmed. Go back and try again.", content_type="text/plain")
     await asyncio.to_thread(chat.rdb.user_touch, who["sid"], who["name"], who.get("avatar", ""))
     _ROLE_CACHE.pop(who["sid"], None)
     print(f"[auth] {prov}: {who['name']} {who['sid']} {who.get('em', '')} allowed={auth.allowed(who)}", flush=True)
+    access_log(req, "signin", prov=prov, em=who["em"])
     r = web.HTTPFound(f"{scheme}://{host}{nxt}")
     r.set_cookie(auth.COOKIE, auth.make_token({k: who[k] for k in ("sid", "name", "avatar", "em") if who.get(k)}), max_age=auth.SESSION_DAYS * 86400,
                  path=prefix or "/", httponly=True, secure=scheme == "https", samesite="Lax")
+    r.del_cookie(auth.STATE_COOKIE, path=prefix or "/")
     raise r
 
 
 async def auth_logout(req: web.Request):
     scheme, host, prefix = origin_of(req)
-    # by email the session is Access's: out there, or the next page signs in again by itself
-    r = web.HTTPFound(f"{scheme}://{host}/cdn-cgi/access/logout" if auth.owner_email() else f"{scheme}://{host}{prefix}/")
+    # the session of Access or of a reverse proxy is theirs: out there, or the next page signs in again by itself
+    mode, out = auth.mode(), auth.header_conf()["logout"]
+    there = "/cdn-cgi/access/logout" if mode == "access" else out if mode == "header" and out.startswith("/") and not out.startswith("//") else prefix + "/"
+    r = web.HTTPFound(f"{scheme}://{host}{there}")
     r.del_cookie(auth.COOKIE, path=prefix or "/")
     raise r
 
@@ -3466,10 +3761,23 @@ _stt_last: dict[str, float] = {}
 
 
 def eleven_key() -> str:
+    """The ElevenLabs key of this chat: its own (elevenlabs.token in its config folder), else the one of the whole install -
+    .lagomchat/elevenlabs.token of the working copy, else the main chat's own - so one key serves every chat (the owner, #3167)"""
+    places = [auth.CONF / "elevenlabs.token"]
     try:
-        return (auth.CONF / "elevenlabs.token").read_text().strip()
-    except OSError:
-        return ""
+        import lagomcfg
+        places.append(lagomcfg.CFG_DIR / "elevenlabs.token")
+        places += [Path(c["conf"]) / "elevenlabs.token" for c in lagomcfg.load().get("chats", {}).values() if c.get("main") and c.get("conf")]
+    except Exception:                                   # a chat run by hand, with no install around it: its own key only
+        pass
+    for f in places:
+        try:
+            k = f.read_text().strip()
+        except OSError:
+            continue
+        if k:
+            return k
+    return ""
 
 
 async def api_stt_token(req: web.Request) -> web.Response:
@@ -3504,13 +3812,16 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
     if me["role"] not in ("owner", "verified"):
         # not let in: no chat at all; a signed-in account may type, and every message gets a refusal
         st = "banned" if me["role"] == "banned" else "pending" if me["signed"] else "signin"
-        cfa = await asyncio.to_thread(auth.cf_access_email, cf_token(req)) if st == "signin" else None
-        await ws.send_str(json.dumps({"type": "gate", "state": st, "providers": [] if auth.owner_email() else sorted(auth.oauth_conf()), "cfa": "" if auth.owner_email() else cfa or "", "name": me["acct_name"] or me["name"],
+        own = auth.mode() == "oauth"                     # the chat's own sign-in: its providers' buttons on the gate
+        cfa = await asyncio.to_thread(auth.cf_access_email, cf_token(req)) if st == "signin" and own else None
+        pn = auth.provider_names() if own else {}
+        await ws.send_str(json.dumps({"type": "gate", "state": st, "providers": sorted(pn), "pnames": pn, "mode": auth.mode(), "cfa": cfa or "", "name": me["acct_name"] or me["name"],
                                       "id": me["id"], "avatar": me["avatar"],
                                       **({"strikes": chat.strikes.get(me["id"], [])} if st == "banned" else {})}, ensure_ascii=False))
         if not me["signed"] or st == "banned":
             await ws.close()
             return ws
+        await guest_knock(req, me, ws)
         async for m in ws:
             if m.type != WSMsgType.TEXT:
                 continue
@@ -3543,6 +3854,7 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                                   "pins": chat.pins_view(0 if me["role"] == "owner" else start),
                                   "tally": {str(i): t for i in chat.votes if i >= start and (t := chat.tally(i))},
                                   "polls": {str(i): chat.poll_view(i, me.get("name") or "owner") for i in chat.polls if i >= start},
+                                  "cards": CARDS,
                                   "reacts": {str(i): r for i, r in chat.reacts.items() if i >= start},   # all they may see, not only of the n newest: older messages come later with no reactions of their own (the owner, #1033)
                                   "votes": {str(i): m[str(chat.rater_of(me)["id"])][1] for i, m in chat.votes.items() if i >= start and str(chat.rater_of(me)["id"]) in m}, "scores": chat.scores(),
                                   "first": max(start, chat.events[0]["id"]) if chat.events else 0}, ensure_ascii=False))
@@ -3578,6 +3890,12 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
             org = req.headers.get("Origin")
             if org and urlparse(org).netloc != req.headers.get("Host"):
                 await send(ws, json.dumps({"type": "error", "error": "wrong origin"}))
+                continue
+            if q.get("confirm") is not None:                     # the owner's Confirm / Refuse on an agent's critical question (#3057)
+                bad = await confirm_pick(req, me, q.get("confirm"), q.get("ok"))
+                if bad:
+                    print(f"[confirm] refused: {bad} ({me.get('role')}/{me.get('name')}@{me.get('ip')})", flush=True)
+                    await send(ws, json.dumps({"type": "error", "error": bad}))
                 continue
             if q.get("title_set") is not None:                   # a double click on the name of the chat: the owner's only (#631)
                 t = " ".join(str(q["title_set"]).split())[:60]
@@ -3859,18 +4177,130 @@ UP_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "ima
             # videos (the owner, 2026-11-03, #1426): up to 50 MB; avi / mkv / mov are made mp4 (H.264 + AAC) so every browser plays them
             "video/mp4": ".mp4", "video/quicktime": ".mov", "video/x-msvideo": ".avi", "video/avi": ".avi", "video/x-matroska": ".mkv",
             # a voice message of the push-to-talk button (the owner, #2773): the page sends wav, kept as m4a every browser plays
-            "audio/wav": ".wav", "audio/x-wav": ".wav"}
+            "audio/wav": ".wav", "audio/x-wav": ".wav",
+            # an iPhone's photo (the owner, #3144): made a JPEG, which every browser and every agent reads
+            "image/heic": ".heic", "image/heif": ".heic", "image/heic-sequence": ".heic", "image/heif-sequence": ".heic",
+            # a PDF (the owner, #3295): kept as it is; the page shows its first page and opens it in a viewer
+            "application/pdf": ".pdf"}
+UP_PDF_MAX = 50 * 2 ** 20
 UP_VOICE_MAX = 12 * 2 ** 20                         # 16 kHz mono: six minutes
-UP_EXT = {".mp4": ".mp4", ".m4v": ".mp4", ".mov": ".mov", ".avi": ".avi", ".mkv": ".mkv"}   # a browser that sends no type: by the name
+UP_EXT = {".mp4": ".mp4", ".m4v": ".mp4", ".mov": ".mov", ".avi": ".avi", ".mkv": ".mkv", ".heic": ".heic", ".heif": ".heic", ".pdf": ".pdf"}   # a browser that sends no type: by the name
 UP_VIDEO_MAX = 50 * 2 ** 20
 # the service's PATH has no anaconda: ffmpeg next to the python that runs the server, else the system's
 FFMPEG = str(Path(sys.executable).with_name("ffmpeg")) if Path(sys.executable).with_name("ffmpeg").exists() else (__import__("shutil").which("ffmpeg") or "ffmpeg")
 UP_MAGIC = {".png": b"\x89PNG", ".jpg": b"\xff\xd8", ".gif": b"GIF8", ".webp": b"RIFF"}
+HEIC_BRANDS = (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1")
+
+
+def heic_to_jpeg(data: bytes) -> bytes | None:
+    """An iPhone's HEIC photo as a JPEG, turned the way it was shot; None: this machine has nothing that reads HEIC.
+    pillow-heif where it is installed (any system), else the Mac's own sips. Not ffmpeg: of an iPhone's file it takes the
+    depth map or one tile, not the picture."""
+    try:
+        import io
+        import pillow_heif
+        from PIL import Image, ImageOps
+        pillow_heif.register_heif_opener()
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        out = io.BytesIO()
+        im.convert("RGB").save(out, "JPEG", quality=88, optimize=True)
+        return out.getvalue()
+    except ImportError:
+        pass
+    except Exception as x:                              # a broken file, or a kind pillow-heif does not read: sips may
+        print(f"[upload] pillow-heif: {x!r}", flush=True)
+    sips = shutil.which("sips") or ("/usr/bin/sips" if Path("/usr/bin/sips").exists() else None)
+    if not sips:
+        return None
+    import subprocess
+    with tempfile.TemporaryDirectory(prefix="lagomheic-") as tmp:
+        src, dst = Path(tmp) / "in.heic", Path(tmp) / "out.jpg"
+        src.write_bytes(data)
+        try:
+            r = subprocess.run([sips, "-s", "format", "jpeg", "-s", "formatOptions", "88", str(src), "--out", str(dst)],
+                               capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as x:
+            print(f"[upload] sips: {x!r}", flush=True)
+            return None
+        if r.returncode or not dst.exists() or not dst.stat().st_size:
+            print(f"[upload] sips failed: {r.stderr.decode(errors='replace')[-300:]}", flush=True)
+            return None
+        return dst.read_bytes()
+
+
 UP_KEEP = 14 * 86400                                # a picture is kept two weeks
 IMG_ROOTS = [Path(p) for p in ("/tmp", str(UPLOADS), *auth.conf_lines("img_roots"))]   # more folders: <conf>/img_roots, a path a line
 IMG_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 VID_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}      # played inline by the page (Range requests work)
 AUD_TYPES = {".m4a": "audio/mp4", ".wav": "audio/wav"}                # a voice message: the page draws it as a bubble with a play button
+# a file a message names by its path: what the page shows and what a person or a token may fetch
+MEDIA_PATH_RE = re.compile(r"(?:/[\w.\-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|m4a|wav|pdf)", re.I)
+DOC_TYPES = {".pdf": "application/pdf"}             # a PDF (the owner, #3295): a card with its first page, a click opens it
+PDF_PV = UPLOADS / ".pdf-pv"                        # the pages drawn, each once: in the user's own folder, not in a shared /tmp
+PDF_MAX_PAGES = 500                                 # pages a card can show: every one is a 2000 px picture on the disk
+_PDF_DRAW = asyncio.Semaphore(2)                    # pdftoppm at once: a person leafing fast does not take every core
+PDF_PV_SIDE = 2000                                  # the longer side: a lone PDF is shown as wide as the chat (the owner, #3299)
+PDF_TOOLS = [p for p in (shutil.which("pdftoppm"), "/opt/homebrew/bin/pdftoppm", "/usr/local/bin/pdftoppm", "/usr/bin/pdftoppm") if p and Path(p).exists()]
+
+
+_PDF_PAGES: dict = {}
+
+
+async def pdf_pages(p: Path) -> int:
+    """how many pages a PDF has (the page's controls, the owner #3302): poppler's pdfinfo, else counted in the file itself
+    (which misses the pages of a PDF that keeps its objects packed: then 1 and no controls)"""
+    st = p.stat()
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    if key not in _PDF_PAGES:
+        n = 0
+        info = PDF_TOOLS and Path(PDF_TOOLS[0]).with_name("pdfinfo")
+        if info and info.exists():
+            try:
+                pr = await asyncio.create_subprocess_exec(str(info), str(p), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await asyncio.wait_for(pr.communicate(), timeout=10)
+                m = re.search(rb"^Pages:\s+(\d+)", out, re.M)
+                n = int(m.group(1)) if m else 0
+            except (OSError, asyncio.TimeoutError):
+                pass
+        if not n:
+            n = len(re.findall(rb"/Type\s*/Page(?![s\w])", await asyncio.to_thread(p.read_bytes)))
+        if len(_PDF_PAGES) > 500:
+            _PDF_PAGES.clear()
+        _PDF_PAGES[key] = max(1, min(n, PDF_MAX_PAGES))
+    return _PDF_PAGES[key]
+
+
+async def pdf_preview(p: Path, page: int = 1) -> Path | None:
+    """a page of a PDF as a PNG (poppler's pdftoppm; the Mac's sips draws only the first), kept by the file's path, time and
+    size; None when it can't be drawn - the page then shows the card without a picture"""
+    st = p.stat()
+    out = PDF_PV / (hashlib.sha1(f"{p}|{st.st_mtime_ns}|{st.st_size}|{PDF_PV_SIDE}|{page}".encode()).hexdigest()[:24] + ".png")
+    if out.exists():
+        return out if out.stat().st_size else None
+    PDF_PV.mkdir(parents=True, exist_ok=True)
+    tmp = PDF_PV / f".{secrets.token_hex(6)}"
+    made = tmp.with_suffix(".png")
+    if PDF_TOOLS:
+        cmd = [PDF_TOOLS[0], "-png", "-f", str(page), "-l", str(page), "-scale-to", str(PDF_PV_SIDE), "-singlefile", str(p), str(tmp)]
+    elif page == 1 and Path("/usr/bin/sips").exists():
+        cmd = ["/usr/bin/sips", "-s", "format", "png", "-Z", str(PDF_PV_SIDE), str(p), "--out", str(made)]
+    else:
+        return None
+    async with _PDF_DRAW:
+        try:
+            pr = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                await asyncio.wait_for(pr.wait(), timeout=20)
+            except asyncio.TimeoutError:
+                pr.kill()
+        except OSError as x:
+            print(f"[pdf] preview: {x!r}", flush=True)
+    if made.exists() and made.stat().st_size:
+        made.replace(out)
+        return out
+    made.unlink(missing_ok=True)
+    out.write_bytes(b"")                              # not asked again: a file that can't be drawn stays so
+    return None
 MAX_VIDEO = 600 * 2 ** 20
 MAX_AGENT_UPLOAD = 20 * 2 ** 20                     # what an agent on another machine may send with a message
 
@@ -3940,7 +4370,7 @@ def _shared_prefs_load() -> dict:
 async def api_prefs(req: web.Request) -> web.Response:
     v = await viewer_of(req)
     em = str(v.get("em") or "").lower()
-    if not em:
+    if not em or v["role"] not in ("owner", "verified"):
         return web.json_response({"ok": False, "error": "sign in first"}, status=401, headers={"Cache-Control": "no-store"})
     if req.method == "GET":
         cur = _shared_prefs_load().get(em) or {}
@@ -4599,10 +5029,20 @@ async def api_upload(req: web.Request):
     ext = UP_TYPES.get(req.headers.get("Content-Type", "").split(";")[0].strip().lower()) or \
         UP_EXT.get(Path(urllib.parse.unquote(req.headers.get("X-Filename", ""))).suffix.lower())
     if not ext:
-        raise web.HTTPUnsupportedMediaType(text="png, jpeg, gif, webp or a video: mp4, mov, avi, mkv")
+        raise web.HTTPUnsupportedMediaType(text="png, jpeg, gif, webp, heic, pdf or a video: mp4, mov, avi, mkv")
     data = await req.read()
+    if ext == ".heic":                                  # an iPhone's photo: a JPEG from here on
+        if data[4:8] != b"ftyp" or data[8:12] not in HEIC_BRANDS or len(data) > 25 * 2 ** 20:
+            raise web.HTTPUnsupportedMediaType(text="not a heic picture (or over 25 MB)")
+        data = await asyncio.to_thread(heic_to_jpeg, data)
+        if not data or not data.startswith(b"\xff\xd8"):
+            raise web.HTTPUnsupportedMediaType(text="this heic picture could not be read; send it as a jpeg")
+        ext = ".jpg"
     video = ext in (".mp4", ".mov", ".avi", ".mkv")
-    if ext == ".wav":
+    if ext == ".pdf":
+        if not data.startswith(b"%PDF-") or len(data) > UP_PDF_MAX:
+            raise web.HTTPUnsupportedMediaType(text="not a pdf file (or over 50 MB)")
+    elif ext == ".wav":
         if data[:4] != b"RIFF" or data[8:12] != b"WAVE" or len(data) > UP_VOICE_MAX:
             raise web.HTTPUnsupportedMediaType(text="not a wav file (or over 12 MB)")
     elif video:
@@ -4675,8 +5115,10 @@ async def api_img(req: web.Request):
     if tok:
         if raw not in remote_paths(tok):
             raise web.HTTPNotFound()
+        since = tok["since"]
     else:
         v = await need_viewer(req)
+        since = None if v["role"] == "owner" else chat.start_for(v)
         if (v["role"] != "owner" and raw not in chat.mine_up.get(v.get("task") or "", ())
                 and raw not in {a.get("av") for a in chat.aliases.get(viewer_key(v), {}).values()} and raw not in chat.visible_paths(chat.start_for(v))):
             raise web.HTTPNotFound()
@@ -4686,11 +5128,29 @@ async def api_img(req: web.Request):
         raise web.HTTPNotFound()
     ext = p.suffix.lower()
     ok = (p.is_file() and ((ext in IMG_TYPES and p.stat().st_size < 40 * 2 ** 20) or (ext in VID_TYPES and p.stat().st_size < MAX_VIDEO)
-                           or (ext in AUD_TYPES and p.stat().st_size < 2 * UP_VOICE_MAX))
-          and any(r in p.parents for r in IMG_ROOTS) and not any(x.startswith(".") for x in p.parts))
+                           or (ext in AUD_TYPES and p.stat().st_size < 2 * UP_VOICE_MAX) or (ext in DOC_TYPES and p.stat().st_size <= UP_PDF_MAX))
+          and any(r in p.parents for r in IMG_ROOTS) and not any(x.startswith(".") for x in p.parts)
+          and (ext not in DOC_TYPES or UPLOADS.resolve() in p.parents))    # a document: only one that was uploaded, not any PDF of a served folder
     if not ok:
         raise web.HTTPNotFound()
-    hd = {"Content-Type": IMG_TYPES.get(ext) or VID_TYPES.get(ext) or AUD_TYPES[ext], "Cache-Control": "max-age=300"}
+    # an import's files have names one can guess (the chat's and the message's numbers), and the uploads folder is one for every
+    # chat: such a path counts only when a message of the import names it, not when somebody typed it
+    if since is not None and any(r in p.parents for r in IMPORT_ROOTS) and not any(
+            e["id"] >= since and ("tg" in e or "im" in e) and raw in MEDIA_PATH_RE.findall(e.get("text") or "") for e in chat.events):
+        raise web.HTTPNotFound()
+    if ext in DOC_TYPES and req.query.get("pv") == "n":  # how many pages, for the card's controls
+        return web.json_response({"pages": await pdf_pages(p) if PDF_TOOLS else 1}, headers={"Cache-Control": "max-age=300"})
+    if ext in DOC_TYPES and req.query.get("pv", "").isdigit():   # a page of a PDF as a picture, for its card
+        n = int(req.query["pv"][:5])
+        if not 1 <= n <= await pdf_pages(p):
+            raise web.HTTPNotFound()
+        pv = await pdf_preview(p, n)
+        if not pv:
+            raise web.HTTPNotFound()
+        return web.FileResponse(pv, headers={"Content-Type": "image/png", "Cache-Control": "max-age=86400"})
+    hd = {"Content-Type": IMG_TYPES.get(ext) or VID_TYPES.get(ext) or AUD_TYPES.get(ext) or DOC_TYPES[ext], "Cache-Control": "max-age=300"}
+    if ext in DOC_TYPES:                                 # shown by the browser's own viewer, never read as anything but a PDF
+        hd.update({"Content-Disposition": f"inline; filename=\"{p.name}\"", "X-Content-Type-Options": "nosniff"})
     if req.query.get("dl") == "1":                       # a download (the owner, #1475: an iPhone saves a file only when it is sent as one)
         hd["Content-Disposition"] = f"attachment; filename=\"{p.name}\""
     return web.FileResponse(p, headers=hd)
@@ -4887,8 +5347,10 @@ def _cal_out(v: dict) -> list[dict]:
     me, now = _cal_me(v), time.time()
     return [{"id": e["id"], "title": e["title"], "at": e["at"], "by": e["by_name"], "by_task": e["by_task"], "who": e["who"],
              "mine": v["role"] == "owner" or e["by_task"] == v["task"], "in": me in e["who"], "notify": e.get("notify", {}).get(me, []),
-             **({"dur": e["dur"], "voters": e.get("voters", []), "slots": {me: e.get("slots", {}).get(me, [])},
-                 # the slots of the others are not shown while the time is looked for (the owner, #2972): only who has given some
+             **({"dur": e["dur"], "voters": e.get("voters", []), # the slots of the others are not shown while the time is looked for (the owner, #2972): only who has given some.
+                 # The owner sees them all and manages them (#3047)
+                 "slots": e.get("slots", {}) if v["role"] == "owner" else {me: e.get("slots", {}).get(me, [])},
+                 "manage": v["role"] == "owner" and not e.get("dl_told"),
                  "gave": [n for n in e.get("voters", []) if any(t > now for t in e.get("slots", {}).get(n, []))], "vote": me in e.get("voters", []) and not e.get("dl_told"),
                  "dl": e.get("dl", 0),
                  # no time suits everyone: the slots of mine that would make it happen, and who else has such a slot (2026-11-15)
@@ -4963,7 +5425,8 @@ async def api_calendar(req: web.Request) -> web.Response:
     its maker is in it; {op: del, id}: by its maker or the owner, who also take a participant out: {op: unwho, id, name}; {op: notify, id, offs: [minutes]}: a participant's own reminders.
     {op: add, title, dur: minutes, who} is an event without a date: {op: slot / unslot, id, at} is a time that suits the one who sends it;
     {op: who, id, name}: its maker or the owner adds a person later, and a time found by slots is open again;
-    {op: dl, id, dl}: they move the deadline of an event that still looks for its time; {op: slot, id, ats: [times]}: several slots at once"""
+    {op: dl, id, dl}: they move the deadline of an event that still looks for its time; {op: slot, id, ats: [times]}: several slots at once;
+    {op: slot / unslot, ..., for: name}: the owner manages the slots of another person of the event"""
     v = await need_viewer(req)
     if req.method == "GET":
         return web.json_response({"ok": True, "events": _cal_out(v), "offs": CAL_OFFS}, headers={"Cache-Control": "no-store"})
@@ -5000,9 +5463,11 @@ async def api_calendar(req: web.Request) -> web.Response:
         chat.cal.remove(ev)
     elif op_ in ("slot", "unslot") and ev:
         t, ats = _int(q.get("at")), q.get("ats")
-        if ev["at"] or not ev.get("dur") or me not in ev.get("voters", []):
+        # {for: name}: the owner gives or takes a slot of another person of the event (#3047); from anybody else it is their own
+        whose = str(q.get("for") or "") if v["role"] == "owner" and q.get("for") else me
+        if ev["at"] or not ev.get("dur") or whose not in ev.get("voters", []):
             return web.json_response({"ok": False, "error": "not_in"}, status=403)
-        mine = ev.setdefault("slots", {}).setdefault(me, [])
+        mine = ev.setdefault("slots", {}).setdefault(whose, [])
         if op_ == "unslot":
             if t in mine:
                 mine.remove(t)
@@ -5161,6 +5626,9 @@ async def version_loop() -> None:
             await chat.watch_all({"type": "version", "v": n, "at": built_at()})
 
 
+PAGE_AT: dict = {}                                   # the page as it is served now: its tag, when it was first served
+
+
 async def page(_req):
     # a chat that moved (#1987): its old address sends the browser to the same name on the new domain, the path and query kept
     host = (_req.headers.get("X-Forwarded-Host") or _req.headers.get("Host", "")).split(":")[0].lower()
@@ -5182,10 +5650,22 @@ async def page(_req):
         pass                                              # no library or no </body>: plain code blocks
     # going between chats (the owner, #2440): the page is ~1 MB; the browser keeps it and asks with its tag, the same page is a
     # 304 with no body, a new one comes compressed
+    # measured (#3252): through Cloudflare the tag did not come back and the whole page was sent at every visit (a proxy that
+    # rewrites the HTML drops its ETag). So: no-transform, and the time this very page was first served as Last-Modified, which
+    # a proxy keeps. Supports-Loading-Mode: the page of another chat of the domain may open this one ahead (the page's specChat)
     tag = '"' + hashlib.sha1(body.encode()).hexdigest()[:20] + '"'
-    if tag.strip('"') in [x.strip().removeprefix("W/").strip('"') for x in _req.headers.get("If-None-Match", "").split(",")]:
-        return web.Response(status=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
-    r = web.Response(text=body, content_type="text/html", headers={"Cache-Control": "no-cache", "ETag": tag})
+    if PAGE_AT.get("tag") != tag:
+        PAGE_AT.update(tag=tag, at=int(time.time()))
+    h = {"ETag": tag, "Cache-Control": "no-cache, no-transform", "Last-Modified": formatdate(PAGE_AT["at"], usegmt=True),
+         "Supports-Loading-Mode": "credentialed-prerender"}
+    inm = _req.headers.get("If-None-Match")
+    try:
+        since = parsedate_to_datetime(_req.headers["If-Modified-Since"]).timestamp() if inm is None and "If-Modified-Since" in _req.headers else None
+    except (TypeError, ValueError):
+        since = None
+    if tag.strip('"') in [x.strip().removeprefix("W/").strip('"') for x in (inm or "").split(",")] or (since is not None and since >= PAGE_AT["at"]):
+        return web.Response(status=304, headers=h)
+    r = web.Response(text=body, content_type="text/html", headers=h)
     r.enable_compression()
     return r
 
@@ -5217,25 +5697,79 @@ async def api_search(req: web.Request):
     a newcomer gets only what they may see. {results: [{event, score, how}], semantic: whether the meaning search answered}"""
     v = await need_viewer(req)
     q = req.query.get("q", "").strip()[:300]
-    if len(q) < 2:
-        return web.json_response({"q": q, "results": [], "semantic": True})
     start = chat.start_for(v)
+    # only the messages of this kind / of talks on this topic (talks.py) / with a picture of this kind (imgdesc.py)
+    kind, topic, pic = req.query.get("kind", ""), req.query.get("topic", ""), req.query.get("pic", "")
+    kind, topic, pic = kind if kind in talks_mod.KINDS else "", topic if topic in talks_mod.TOPICS else "", pic if pic in PIC_KINDS else ""
+
+    def wanted(i: int) -> bool:
+        return ((not kind or chat.talks.kind.get(i) == kind) and (not topic or chat.talks.topic.get(i) == topic)
+                and (not pic or any((chat.img.get(p) or {}).get("kind") == pic for p in chat.pics.get(i, ()))))
+
+    lists = {"kinds": talks_mod.KINDS, "topics": talks_mod.TOPICS, "pkinds": PIC_KINDS, "classified": len(chat.talks.kind)}
+    if len(q) < 2:
+        # no text: the categories are browsed (the owner, #3216) - how many messages each holds, and with one picked, its
+        # messages and talks, the newest first
+        counts = {"kinds": {}, "topics": {}, "pkinds": {}}
+        for i, k in chat.talks.kind.items():
+            if i >= start and i not in chat.deleted:
+                counts["kinds"][k] = counts["kinds"].get(k, 0) + 1
+                t = chat.talks.topic.get(i, "other")
+                counts["topics"][t] = counts["topics"].get(t, 0) + 1
+        for i, ps in chat.pics.items():
+            if i >= start and i not in chat.deleted:
+                for k in {(chat.img.get(p) or {}).get("kind") for p in ps} - {None}:
+                    counts["pkinds"][k] = counts["pkinds"].get(k, 0) + 1
+        out, found, total = [], [], 0
+        if kind or topic or pic:
+            for e in reversed(chat.events):
+                if e["id"] < start or e["kind"] != "msg" or e["id"] in chat.deleted or not wanted(e["id"]):
+                    continue
+                total += 1
+                if len(out) < 200:
+                    view = chat.view_for(e, start, v["role"])
+                    if view and view["kind"] == "msg":
+                        out.append({"event": view, "score": 1.0, "how": "browse", "pics": chat.pic_views(view["text"]),
+                                    "k": chat.talks.kind.get(e["id"], ""), "tp": chat.talks.topic.get(e["id"], "")})
+            if topic and not pic:
+                byid = {e["id"]: e for e in chat.events}
+                for a in sorted(chat.talks.by_a, reverse=True):
+                    r, e = chat.talks.by_a[a], byid.get(a)
+                    if (a >= start and e and a not in chat.deleted and r["topic"] == topic and r["n"] >= 3 and r["title"]
+                            and (not kind or kind in r["kinds"])):
+                        found.append({"a": a, "b": r["b"], "n": r["n"], "title": r["title"], "sum": r["sum"], "topic": r["topic"],
+                                      "tags": r["tags"], "ts": e["ts"], "score": 1.0})
+                        if len(found) >= 40:
+                            break
+        return web.json_response({"q": "", "results": out, "semantic": True, "exact": True, "browse": True, "total": total, "talks": found,
+                                  "counts": counts, **lists}, headers={"Cache-Control": "no-store"})
+
+    def res_of(view: dict, score: float, how: str) -> dict:
+        return {"event": view, "score": score, "how": how, "pics": chat.pic_views(view["text"]),
+                "k": chat.talks.kind.get(view["id"], ""), "tp": chat.talks.topic.get(view["id"], "")}
+
     if req.query.get("exact") == "1":
         # "simple match" (the owner, 2026-11-02): the text as typed, anywhere in a message, any case - no meaning, no word
         # splitting; the newest first
         qlow, out = q.lower(), []
         for e in reversed(chat.events):
-            if e["id"] < start or e["kind"] != "msg" or e["id"] in chat.deleted or qlow not in (e["text"] or "").lower():
+            if e["id"] < start or e["kind"] != "msg" or e["id"] in chat.deleted or not wanted(e["id"]):
+                continue
+            if qlow not in (e["text"] or "").lower() and qlow not in chat.pic_text.get(e["id"], "").lower():
                 continue
             view = chat.view_for(e, start, v["role"])
             if view and view["kind"] == "msg":
-                out.append({"event": view, "score": 1.0, "how": "exact"})
+                out.append(res_of(view, 1.0, "exact"))
                 if len(out) >= 200:
                     break
-        return web.json_response({"q": q, "results": out, "semantic": True, "exact": True}, headers={"Cache-Control": "no-store"})
-    sem = await asyncio.to_thread(chat.vec.query, q, start, 30)
-    ok_sem = bool(sem) or not chat.vec.error
+        return web.json_response({"q": q, "results": out, "semantic": True, "exact": True, **lists}, headers={"Cache-Control": "no-store"})
+    qv = await asyncio.to_thread(chat.vec.qvec, q)
+    sem = await asyncio.to_thread(chat.vec.near, qv, start, 300 if kind or topic or pic else 30)
+    ok_sem = qv is not None or not chat.vec.error
     score: dict[int, tuple[float, str]] = {i: (s, "meaning") for i, s in sem}
+    for i, s in chat.pvec.near(qv, start, 300 if kind or topic or pic else 30):               # what is on a message's pictures (imgdesc.py)
+        if i in chat.pic_text and s > score.get(i, (0.0, ""))[0]:
+            score[i] = (s, "picture")
     res = _word_res(_words(q))
     qlow = q.lower()
     byid = {e["id"]: e for e in chat.events}
@@ -5243,9 +5777,14 @@ async def api_search(req: web.Request):
         if e["id"] < start or e["kind"] != "msg" or e["id"] in chat.deleted:
             continue
         low = (e["text"] or "").lower() + " " + e["agent"].lower()
+        pic = chat.pic_text.get(e["id"])
+        in_pic = False
+        if pic:                                              # the words are on its picture, not in its text
+            in_pic = not (qlow in low or (res and all(r.search(low) for r in res)))
+            low += " " + pic.lower()
         got = sum(1 for r in res if r.search(low))
-        base = score.get(e["id"], (0.0, ""))[0]
-        how = "words" if base < 0.40 else "words + meaning"
+        base, was = score.get(e["id"], (0.0, ""))
+        how = ("picture" if in_pic or was == "picture" else "words") if base < 0.40 else "picture" if was == "picture" else "words + meaning"
         if qlow in low:                                      # the text as typed: on top
             score[e["id"]] = (min(1.0, max(base, 0.45) + 0.35), how)
         elif res and got == len(res):
@@ -5253,12 +5792,30 @@ async def api_search(req: web.Request):
         elif got and got * 2 >= len(res):                    # half of the words or more: below what has them all, and below a match in meaning
             score[e["id"]] = (max(base, 0.30 + 0.20 * got / len(res)), how if base else "words")
     out = []
-    for i, (s, how) in sorted(score.items(), key=lambda kv: (-kv[1][0], -kv[0]))[:30]:     # of equal ones the newest first
+    for i, (s, how) in sorted(score.items(), key=lambda kv: (-kv[1][0], -kv[0])):     # of equal ones the newest first
         e = byid.get(i)
-        view = chat.view_for(e, start, v["role"]) if e else None
+        view = chat.view_for(e, start, v["role"]) if e and wanted(i) else None
         if view and view["kind"] == "msg":
-            out.append({"event": view, "score": round(s, 3), "how": how})
-    return web.json_response({"q": q, "results": out, "semantic": ok_sem}, headers={"Cache-Control": "no-store"})
+            out.append(res_of(view, round(s, 3), how))
+            if len(out) >= 30:
+                break
+    # the talks that were about it (talks.py): by meaning of their title and summary, and by the words in them
+    tsc: dict[int, float] = {a: s for a, s in chat.tvec.near(qv, start, 8, 0.5)}
+    for a, r in chat.talks.by_a.items():
+        if a < start or r["n"] < 3 or not r["title"]:
+            continue
+        low = talks_mod.Talks.text(r).lower()
+        if qlow in low or (res and all(x.search(low) for x in res)):
+            tsc[a] = min(1.0, max(tsc.get(a, 0.0), 0.45) + 0.3)
+    found = []
+    for a, s in sorted(tsc.items(), key=lambda kv: (-kv[1], -kv[0])):
+        r, e = chat.talks.by_a.get(a), byid.get(a)
+        if r and e and a not in chat.deleted and (not topic or r["topic"] == topic):
+            found.append({"a": a, "b": r["b"], "n": r["n"], "title": r["title"], "sum": r["sum"], "topic": r["topic"], "tags": r["tags"],
+                          "ts": e["ts"], "score": round(s, 3)})
+            if len(found) >= 5:
+                break
+    return web.json_response({"q": q, "results": out, "semantic": ok_sem, "talks": found, **lists}, headers={"Cache-Control": "no-store"})
 
 
 REPO_SKILLS = "agents-chat (agentchat)"
@@ -5295,6 +5852,176 @@ async def api_events(req: web.Request):
     n = max(1, min(int(req.query.get("n", "500")), 5000))
     got = [x for x in (chat.view_for(e, start, v["role"]) for e in chat.events if e["id"] < before) if x is not None][-n:]
     return web.json_response({"events": got, "first": max(start, chat.events[0]["id"]) if chat.events else 0})
+
+
+PERF_KEYS = ("type", "from", "fetch", "conn", "ttfb", "resp", "kb", "dom", "ws", "init", "initkb", "paint", "pre", "net", "rtt", "mob")
+
+
+async def api_perf(req: web.Request) -> web.Response:
+    """how long the page took to open, as its browser measured it (ms from the start of the navigation): one line in the log
+    (the owner, #3252: going between chats is slow)"""
+    v = await need_viewer(req)
+    try:
+        d = await req.json()
+        d = d if isinstance(d, dict) else {}
+    except (ValueError, TypeError):
+        d = {}
+    vals = " ".join(k + "=" + re.sub(r"[^\w.:-]", "", str(d.get(k, "")))[:40] for k in PERF_KEYS)
+    print(f"[perf] {v.get('role')}/{v.get('name') or '-'} {vals}", flush=True)
+    return web.json_response({"ok": True})
+
+
+async def api_days(req: web.Request):
+    """the days of a month that have messages (the owner, #3243: go to a date from the calendar): {day of the month: [the
+    first message's id, how many]}, by the page's own time zone"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    v = await need_viewer(req)
+    start = chat.start_for(v)
+    try:
+        y, m = int(req.query["y"]), int(req.query["m"])
+        tz = ZoneInfo(req.query.get("tz") or "UTC")
+        a = datetime(y, m, 1, tzinfo=tz).timestamp()
+        b = datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=tz).timestamp()
+    except Exception:
+        return web.json_response({"ok": False, "error": "y, m, tz"}, status=400)
+    days: dict = {}
+    for e in chat.events:
+        if e["kind"] != "msg" or e["id"] < start or not a <= e.get("ts", 0) < b or e["id"] in chat.deleted:
+            continue
+        d = days.setdefault(datetime.fromtimestamp(e["ts"], tz).day, [e["id"], 0])
+        d[0] = min(d[0], e["id"])
+        d[1] += 1
+    return web.json_response({"ok": True, "y": y, "m": m, "days": days})
+
+
+# ---------------------------------------------------------------- import (the owner, 2026-11-16)
+# a Telegram chat brought into this one (tgimport.py): the owner gives the folder Telegram Desktop exported - on this machine -
+# in Settings, or when the chat is made (chats.py create --import: the folder waits in <data>/import_pending.json and the page
+# opens the import with it). The messages keep their time and come after what the chat has; the files go to the uploads' tg/
+# folder, which the two weeks' sweep does not touch. A folder imported again brings only what is new.
+# A conversation of iMessage the same way (imimport.py, src "im"): the folder is ~/Library/Messages of this Mac or a copy of
+# it, and one of its conversations is chosen first; its files go to the uploads' im/ folder
+IMPORT: dict = {"run": False}
+IMPORT_DIR = UPLOADS / "tg"
+IMPORT_ROOTS = tuple((UPLOADS / x).resolve() for x in ("tg", "im"))
+IMPORT_PENDING = DATA / "import_pending.json"
+
+
+def _imp_known(tg: str, src: str = "tg") -> tuple[Path, dict]:
+    f = DATA / f'import_{src}_{re.sub(r"[^0-9A-Za-z_-]", "", tg) or "0"}.json'
+    try:
+        return f, json.loads(f.read_text())
+    except (OSError, ValueError):
+        return f, {}
+
+
+def _imp_scan(path: str, src: str = "tg", conv: int = 0) -> dict:
+    s = imimport.scan(path, conv) if src == "im" else tgimport.scan(path)
+    known = _imp_known(s["tg"], src)[1]
+    if known:
+        s = imimport.scan(path, conv, known) if src == "im" else tgimport.scan(path, known)
+    return dict(s, src=src)
+
+
+def _imp_people(asked, scan: dict) -> dict:
+    """who the Telegram accounts are here: {account id: {"as": "owner" | "person" | "skip", "name"}} -> {account id: {name, task}}"""
+    out, taken = {}, {a["name"].lower() for a in chat.agents.values()}
+    for p in scan["people"]:
+        q = asked.get(p["id"]) if isinstance(asked, dict) and isinstance(asked.get(p["id"]), dict) else {}
+        if q.get("as") == "owner":
+            out[p["id"]] = {"name": USER["name"], "task": USER["task"]}
+        elif q.get("as") == "person":
+            n = _name_of(str(q.get("name") or p["name"]))
+            if not n or n.lower() in USER_NAMES or n.lower() in taken:
+                raise tgimport.Bad("name_taken")
+            # a person of this chat under that name: the messages are theirs; nobody: a person of the import, by the account's id
+            old = next((e for e in reversed(chat.events) if str(e.get("task", "")).startswith("user:") and e["agent"].lower() == n.lower()), None)
+            out[p["id"]] = {"name": old["agent"], "task": old["task"]} if old else {"name": n, "task": (
+                "user:im:" + hashlib.sha256(p["id"].encode()).hexdigest()[:12] if scan.get("src") == "im" else "user:tg:" + re.sub(r"\D", "", p["id"]))}
+    if len({x["task"] for x in out.values()}) < len(out):
+        raise tgimport.Bad("name_taken")                     # two accounts as one person
+    if not out:
+        raise tgimport.Bad("bad_request")
+    return out
+
+
+def _imp_view() -> dict:
+    return {k: IMPORT.get(k) for k in ("run", "done", "total", "name", "added", "error")}
+
+
+async def _imp_run(path: str, people: dict, scan: dict) -> None:
+    loop = asyncio.get_running_loop()
+
+    def progress(i: int, n: int) -> None:
+        IMPORT.update(done=i, total=n)
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(chat.watch_all({"type": "import", **_imp_view()})))
+    try:
+        f, known = _imp_known(scan["tg"], scan["src"])
+        if scan["src"] == "im":
+            r = await asyncio.to_thread(imimport.build, path, scan["chat"], people, UPLOADS / "im" / scan["tg"], known, FFMPEG, progress)
+        else:
+            r = await asyncio.to_thread(tgimport.build, path, people, IMPORT_DIR / (re.sub(r"\D", "", scan["tg"]) or "0"), known, FFMPEG, progress)
+        base = chat.take_in(r["events"], r["reacts"]) if r["events"] else chat.next_id
+        known.update({k: base + i for k, i in r["map"].items()})
+        f.write_text(json.dumps(known))
+        IMPORT_PENDING.unlink(missing_ok=True)
+        IMPORT.update(run=False, added=len(r["events"]), error="")
+        print(f'[import] {scan["src"]} {scan["name"]!r}: {len(r["events"])} messages from #{base}, {r["skipped"]} left out', flush=True)
+    except Exception as x:
+        IMPORT.update(run=False, added=None, error=str(x) if isinstance(x, tgimport.Bad) else "import_failed")
+        print(f"[import] failed: {x!r}", flush=True)
+    await chat.watch_all({"type": "import", **_imp_view()})
+
+
+async def api_import(req: web.Request) -> web.Response:
+    """GET: the folder that waits to be imported and how a running import goes. POST {op: scan, path}: what the folder holds;
+    with src: "im" it is a folder of iMessage: {op: chats, path} lists its conversations, scan and run take one as `chat`;
+    {op: run, path, people}: bring it in; {op: forget}: the waiting folder is not wanted. The owner only"""
+    v = await need_viewer(req)
+    if v["role"] != "owner":
+        raise web.HTTPForbidden()
+    if req.method == "GET":
+        try:
+            pend = str(json.loads(IMPORT_PENDING.read_text()).get("path") or "")
+        except (OSError, ValueError, AttributeError):
+            pend = ""
+        return web.json_response({"ok": True, "pending": pend, "state": _imp_view()}, headers={"Cache-Control": "no-store"})
+    if not _same_page(req):
+        raise web.HTTPForbidden()
+    try:
+        q = await req.json()
+        assert isinstance(q, dict)
+    except Exception:
+        return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+    op_ = q.get("op")
+    if op_ == "forget":
+        IMPORT_PENDING.unlink(missing_ok=True)
+        return web.json_response({"ok": True})
+    src, path = ("im" if q.get("src") == "im" else "tg"), str(q.get("path") or "")[:1000]
+    if op_ == "chats" and src == "im":                       # the conversations of a Messages folder: one of them is imported
+        try:
+            return web.json_response({"ok": True, **(await asyncio.to_thread(imimport.chats, path))})
+        except tgimport.Bad as x:
+            return web.json_response({"ok": False, "error": str(x)})
+    if op_ not in ("scan", "run"):
+        return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+    if IMPORT.get("run"):
+        return web.json_response({"ok": False, "error": "import_running"})
+    try:
+        scan = await asyncio.to_thread(_imp_scan, path, src, _int(q.get("chat")))
+        if op_ == "scan":
+            return web.json_response({"ok": True, "scan": scan})
+        people = _imp_people(q.get("people"), scan)
+    except tgimport.Bad as x:
+        return web.json_response({"ok": False, "error": str(x)})
+    if IMPORT.get("run"):
+        return web.json_response({"ok": False, "error": "import_running"})
+    IMPORT.clear()
+    IMPORT.update(run=True, done=0, total=scan["n"], name=scan["name"], added=None, error="")
+    print(f'[import] {v.get("name")}: {src} {scan["name"]!r} from {scan["path"]}', flush=True)
+    asyncio.create_task(_imp_run(scan["path"], people, scan))
+    return web.json_response({"ok": True, "state": _imp_view()})
 
 
 # ---------------------------------------------------------------- export (the owner, 2026-11-07, #261)
@@ -5556,6 +6283,25 @@ async def join_page(req: web.Request) -> web.Response:
     return web.Response(text=_join_text(req), content_type="text/markdown", charset="utf-8", headers={"Cache-Control": "no-store"})
 
 
+async def signin_page(_req: web.Request) -> web.Response:
+    """/signin: the chat's own page with the ways to sign in (the owner, 2026-11-16). Cloudflare Access lets everybody see it; each
+    button leads to /in/<way>, which Access guards with that one way alone, so its own page with the choice is not shown.
+    Another sign-in mode: the chat's page, whose gate has that mode's ways"""
+    if auth.mode() != "access":
+        scheme, host, prefix = origin_of(_req)
+        raise web.HTTPFound(f"{scheme}://{host}{prefix}/")
+    t = html_escape(chat.title)
+    body = (HERE / "signin.html").read_text().replace(f"<title>{DEFAULT_TITLE}</title>", f"<title>{t}</title>", 1) \
+        .replace(f"<h1>{DEFAULT_TITLE}</h1>", f"<h1>{t}</h1>", 1)
+    return web.Response(text=body, content_type="text/html", charset="utf-8", headers={"Cache-Control": "no-store"})
+
+
+async def signin_done(req: web.Request):
+    """/in/<way>: who got here has signed in at Cloudflare Access that way; on to the chat, which Access now lets them into"""
+    scheme, host, prefix = origin_of(req)
+    raise web.HTTPFound(f"{scheme}://{host}{prefix}/")
+
+
 async def join_cli(_req: web.Request) -> web.Response:
     # the agents' command alone: agentchat.py needs python3 with websockets; its `help` asks this chat for the rules
     return web.Response(body=(HERE / "agentchat.py").read_bytes(), content_type="text/x-python", headers={"Cache-Control": "no-store"})
@@ -5566,7 +6312,8 @@ async def join_rules(_req: web.Request) -> web.Response:
 
 
 async def healthz(_req):
-    return web.Response(text=f"ok {len(chat.agents)} agents")
+    # when this server began: the manager shows a chat whose code on disk is newer than that (it needs a restart)
+    return web.Response(text=f"ok {len(chat.agents)} agents, started {STARTED:.0f}")
 
 
 async def mongo_loop() -> None:
@@ -5632,9 +6379,116 @@ async def vec_loop() -> None:
         await asyncio.sleep(4)
 
 
+def pic_file(raw: str) -> bool:
+    """a picture the page may show (api_img's rule): an image file under the pictures' folders, not in a hidden one"""
+    try:
+        p = Path(raw).resolve(strict=True)
+        return (p.is_file() and p.suffix.lower() in IMG_TYPES and 0 < p.stat().st_size < 40 * 2 ** 20
+                and any(r in p.parents for r in IMG_ROOTS) and not any(x.startswith(".") for x in p.parts))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+async def img_loop() -> None:
+    """the model looks at the chat's pictures, one at a time, the newest messages' first, and what it says joins the search.
+    No vision server set, or it is down (the GPU does something else): waits and asks again, nothing else changes"""
+    seen, todo, queued, was_up, said = -1, [], set(), None, 0
+    await asyncio.sleep(6)
+    while True:
+        try:
+            new = []
+            for e in reversed(chat.events):                            # the messages that came since the last look
+                if e["id"] <= seen:
+                    break
+                new += [p for p in reversed(chat.pics_of(e)) if p not in queued]
+            if chat.events:
+                seen = max(seen, chat.events[-1]["id"])
+            queued.update(new)
+            todo += reversed(new)                                      # the end of the list is taken first: the newest
+            idx = [(i, t) for i, t in chat.pic_text.items() if i not in chat.pvec.have][:16]
+            if idx and await asyncio.to_thread(chat.pvec.add, idx):
+                continue
+            if not todo and chat.img.url():                            # all looked at: the ones whose answer was cut off, once more
+                todo += [p for p in chat.img.cut_off() if p in chat.pic_ids]   # with more room for it (the owner, #3224)
+            if not todo or not chat.img.url():
+                await asyncio.sleep(20 if not todo else 60)
+                continue
+            p = todo[-1]
+            again = (chat.img.d.get(p) or {}).get("err") == "no answer" and not chat.img.d[p].get("again")
+            if (p in chat.img.d and not again) or not await asyncio.to_thread(pic_file, p):   # gone (the two weeks' sweep) or not ours to read: skipped
+                todo.pop()
+                continue
+            rec = await asyncio.to_thread(chat.img.describe, p, again)
+            todo.pop()
+            await asyncio.to_thread(chat.img.put, p, rec)
+            ids = set(chat.pic_ids.get(p, ()))
+            for i in ids:
+                chat.pic_said(i)
+            await asyncio.to_thread(chat.pvec.drop, ids)               # a message with two pictures: indexed again with both
+            if was_up is not True:
+                print(f"[pics] the vision server answers: {len(todo)} pictures to look at", flush=True)
+            was_up, said = True, said + 1
+            if said % 100 == 0 or not todo:
+                print(f"[pics] {said} looked at, {len(todo)} to go", flush=True)
+        except VisionDown as x:
+            if was_up is not False:
+                print(f"[pics] waiting for the vision server ({x}); {len(todo)} pictures to look at", flush=True)
+            was_up = False
+            await asyncio.sleep(120)
+        except Exception as x:                                         # never takes the chat down
+            print(f"[pics] {type(x).__name__}: {str(x)[:160]}", flush=True)
+            await asyncio.sleep(60)
+
+
+async def talk_loop() -> None:
+    """the model reads the chat talk by talk, the newest first (talks.py): a title, a summary, a topic, a kind for every
+    message. The server is not set or down: waits and asks again"""
+    last, todo, was_up, said = None, [], None, 0
+    await asyncio.sleep(9)
+    while True:
+        try:
+            now = time.time()
+            mark = (chat.next_id, int(now // 600))                     # a new message, or ten minutes on (the last talk closes by time)
+            if mark != last:
+                last = mark
+                msgs = [e for e in chat.events if e["kind"] == "msg" and e["id"] not in chat.deleted and (e["text"] or "").strip()]
+                todo = [seg for seg, closed in talks_mod.cut(msgs, now)
+                        if closed and (chat.talks.by_a.get(seg[0]["id"]) or {}).get("b") != seg[-1]["id"]]
+            idx = [(a, talks_mod.Talks.text(r)) for a, r in chat.talks.by_a.items() if a not in chat.tvec.have and r["n"] >= 3 and r["title"]][:16]
+            if idx and await asyncio.to_thread(chat.tvec.add, idx):
+                continue
+            if not todo or not chat.img.url():
+                await asyncio.sleep(30)
+                continue
+            seg = todo[-1]
+
+            def said_in(e: dict) -> str:                               # a picture's path says nothing: what is on it does
+                return PIC_RE.sub(lambda m: f"[picture: {(chat.img.get(m.group(0)) or {}).get('en', '')}]", e["text"])
+            rec = await asyncio.to_thread(chat.talks.classify, [(e["id"], e["agent"], said_in(e)) for e in seg])
+            todo.pop()
+            if rec["a"] in chat.tvec.have:                             # the talk read again (it grew, messages were taken out)
+                await asyncio.to_thread(chat.tvec.drop, {rec["a"]})
+            await asyncio.to_thread(chat.talks.put, rec)
+            if was_up is not True:
+                print(f"[talks] the model answers: {len(todo) + 1} talks to read", flush=True)
+            was_up, said = True, said + 1
+            if said % 100 == 0 or not todo:
+                print(f"[talks] {said} read, {len(todo)} to go", flush=True)
+        except VisionDown as x:
+            if was_up is not False:
+                print(f"[talks] waiting for the model server ({x}); {len(todo)} talks to read", flush=True)
+            was_up = False
+            await asyncio.sleep(120)
+        except Exception as x:                                         # never takes the chat down
+            print(f"[talks] {type(x).__name__}: {str(x)[:160]}", flush=True)
+            await asyncio.sleep(60)
+
+
 async def on_start(app):
     asyncio.ensure_future(chat.people_after_restart())
     app["vec"] = asyncio.create_task(vec_loop())
+    app["pics"] = asyncio.create_task(img_loop())
+    app["talks"] = asyncio.create_task(talk_loop())
     app["reaper"] = asyncio.create_task(chat.reaper())
     app["batcher"] = asyncio.create_task(chat.batcher())
     app["usage"] = asyncio.create_task(chat.usage_loop())
@@ -5689,7 +6543,7 @@ def main():
     chat = Chat()
     app = web.Application(client_max_size=55 * 2 ** 20)          # a video up to 50 MB (#1426)
     if UPLOADS.is_dir():                              # two weeks, then gone
-        for f in UPLOADS.iterdir():
+        for f in (*UPLOADS.iterdir(), *(PDF_PV.iterdir() if PDF_PV.is_dir() else ())):
             if f.is_file() and time.time() - f.stat().st_mtime > UP_KEEP:
                 f.unlink(missing_ok=True)
     app.router.add_get("/", page)
@@ -5704,12 +6558,16 @@ def main():
     app.router.add_get("/listen", ws_listen)
     app.router.add_get("/watch", ws_watch)
     app.router.add_get("/log.txt", log_txt)
+    app.router.add_get("/signin", signin_page)
+    app.router.add_get("/in/{way:google|github|code|passkey}", signin_done)
     app.router.add_get("/join", join_page)                # how an agent joins (the owner, #2335): no secrets in it, no sign-in
     app.router.add_get("/join/lagomchat", join_cli)
     app.router.add_get("/join/rules", join_rules)
     app.router.add_route("*", "/join/knock", join_knock)   # an agent elsewhere asks the owner in; GET: its answer
     app.router.add_get("/api/agents", api_agents)
     app.router.add_get("/api/events", api_events)
+    app.router.add_get("/api/days", api_days)
+    app.router.add_post("/api/perf", api_perf)
     app.router.add_get("/api/export", api_export)
     app.router.add_post("/api/export", api_export)
     app.router.add_get("/api/mongo", api_mongo)
@@ -5722,6 +6580,7 @@ def main():
     app.router.add_get("/api/shot/{name}", api_shot)
     app.router.add_get("/api/release", api_release)
     app.router.add_route("*", "/api/calendar", api_calendar)
+    app.router.add_route("*", "/api/import", api_import)
     app.router.add_get("/api/clocks", api_clocks)
     app.router.add_post("/api/stt_token", api_stt_token)
     app.router.add_get("/api/pr/diff", api_pr_diff)
@@ -5738,9 +6597,9 @@ def main():
     app.router.add_get("/{f:sw\\.js|appicon-192\\.png|appicon-512\\.png|apple-touch-icon\\.png}", push_static)
     app.router.add_get("/chaticon/{f:[a-z0-9-]{1,60}\\.(?:png|jpg|webp|gif)}", chaticon_file)
     app.router.add_get("/auth/logout", auth_logout)
-    app.router.add_get("/auth/{prov:google}/login", oauth_login)
     app.router.add_get("/auth/cf/login", cf_login)
-    app.router.add_get("/auth/{prov:google}/callback", oauth_callback)
+    app.router.add_get("/auth/{prov:[a-z][a-z0-9_-]{0,23}}/login", oauth_login)
+    app.router.add_get("/auth/{prov:[a-z][a-z0-9_-]{0,23}}/callback", oauth_callback)
     app.router.add_get("/img", api_img)
     app.router.add_post("/upload", api_upload)
     app.router.add_post("/api/display_name", api_display_name)

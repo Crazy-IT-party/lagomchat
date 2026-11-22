@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -48,6 +50,7 @@ CONF_FILES = {
     "giphy_token": ("giphy.token", "line"),
     "telegram_token": ("telegram_bot.token", "line"),
     "guests": ("allow.json", "json"),
+    "signin": ("signin.json", "secret-json"),          # the sign-in mode and its providers (auth.py); none: the file is not there
 }
 # a chat's settings given to its server in the environment
 ENV = {"cf_aud": "LAGOMCHAT_CF_AUD", "embed_url": "LAGOMCHAT_EMBED_URL", "leave_delay": "LAGOMCHAT_LEAVE_DELAY",
@@ -56,10 +59,16 @@ ENV = {"cf_aud": "LAGOMCHAT_CF_AUD", "embed_url": "LAGOMCHAT_EMBED_URL", "leave_
 CHAT_DEFAULTS = {"title": "", "host": "", "port": 0, "main": False, "auth": False, "owner_email": "", "reserved_names": [],
                  "score_rival": "", "owner_steam": "", "giphy_token": "", "telegram_token": "",
                  "guests": {"google_domains": [], "google_emails": [], "discord_ids": []},
+                 "signin": {},
+                 "via": "",                              # how the chat is reached: '' (by its address: this machine, or Cloudflare) / ngrok / caddy
+                 "ngrok_oauth": "",                      # an ngrok chat whose sign-in is ngrok's: the provider there (none: google)
                  "cf_aud": "", "embed_url": "", "leave_delay": 1800, "people_quiet": 30, "idle_hide": 1800,
                  "agent_turns": 10}
 DEFAULTS = {"owner_email": "", "domain": "", "domains": [], "moved_from": [], "plugins": [],
-            "cloudflare": {"token": "", "account": "", "tunnel": "", "idp": "", "team": "", "zones": {}}, "chats": {}}
+            "cloudflare": {"token": "", "account": "", "tunnel": "", "idp": "", "team": "", "zones": {}},
+            "ngrok": {"authtoken": "", "bin": ""},      # chats reached through an ngrok tunnel (one agent for them all)
+            "caddy": {"run": False, "bin": "", "email": ""},   # chats on an own domain behind Caddy; run: its service is ours
+            "chats": {}}
 MANAGER_PORT = 8159
 PORTS = range(8170, 8200)
 
@@ -77,11 +86,23 @@ def load() -> dict:
     return normal(c)
 
 
+def pruned(v):
+    """a setting without its empty parts ('' / [] / {} / False / None): a form sends every field, a file holds what is set"""
+    if isinstance(v, dict):
+        return {k: w for k, w in ((k, pruned(w)) for k, w in v.items()) if w not in ("", None, False, [], {})}
+    if isinstance(v, list):
+        return [w for w in (pruned(w) for w in v) if w not in ("", None, [], {})]
+    return v.strip() if isinstance(v, str) else v
+
+
 def normal(c: dict) -> dict:
     out = json.loads(json.dumps(DEFAULTS))
     out.update({k: v for k, v in (c or {}).items() if k in DEFAULTS or k.startswith("x_")})
-    out["cloudflare"] = {**DEFAULTS["cloudflare"], **(c.get("cloudflare") or {})}
+    for k in ("cloudflare", "ngrok", "caddy"):
+        out[k] = {**DEFAULTS[k], **(c.get(k) or {})}
     out["chats"] = {s: {**json.loads(json.dumps(CHAT_DEFAULTS)), **v} for s, v in (c.get("chats") or {}).items()}
+    for ch in out["chats"].values():
+        ch["signin"] = pruned(ch.get("signin")) if isinstance(ch.get("signin"), dict) else {}
     return out
 
 
@@ -245,7 +266,9 @@ def apply(c: dict) -> list[str]:
         vals = {**ch, "owner_email": ch.get("owner_email") or c.get("owner_email") or ""}
         for key, (f, kind) in CONF_FILES.items():
             v = vals.get(key)
-            if kind == "json":
+            if kind == "secret-json":
+                ch_changed |= _write(conf / f, json.dumps(v, ensure_ascii=False, indent=1) + "\n", 0o600) if v else _rm(conf / f)
+            elif kind == "json":
                 ch_changed |= _write(conf / f, json.dumps(v or {}, ensure_ascii=False, indent=1) + "\n")
             elif kind == "lines":
                 ch_changed |= _write(conf / f, "".join(f"{x}\n" for x in v or [])) if v else _rm(conf / f)
@@ -261,21 +284,189 @@ def apply(c: dict) -> list[str]:
             changed.append(slug)
     if not MAC and changed:
         _run("systemctl", "--user", "daemon-reload")
+    front_doors(c)
     return changed
 
 
-# ---------------------------------------------------------------- the chats
-def status(c: dict) -> list[dict]:
-    out = []
-    for slug, ch in sorted(c["chats"].items(), key=lambda kv: (not kv[1].get("main"), kv[1].get("created") or 0)):
-        out.append({"slug": slug, "title": _read(Path(ch.get("data") or "/nonexistent") / "title.txt") or ch.get("title") or slug, "url": chat_url(ch), "port": ch["port"],
-                    "main": bool(ch.get("main")), "running": listening(ch["port"]), "local": not ch.get("host") or
-                    ch["host"].startswith("127.")})
+# ---------------------------------------------------------------- the ways in that are not Cloudflare: ngrok, an own domain behind Caddy
+# One ngrok agent and one Caddy serve every chat that is reached through them; their files are written out of the config
+# (.lagomchat/ngrok.yml, .lagomchat/Caddyfile) and their services follow: there while a chat needs them, restarted when the file changes.
+OPEN_PATHS = ("/ws", "/listen", "/img", "/join")       # the agents' doors: the server checks a token there, no sign-in in front
+NGROK_OAUTH = ("google", "github", "gitlab", "microsoft", "linkedin", "twitch")   # the providers ngrok has an app of its own for
+HOST_RE = re.compile(r"(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+
+
+def via(ch: dict) -> str:
+    """how a chat is reached: local / cloudflare / ngrok / caddy"""
+    if ch.get("via") in ("ngrok", "caddy"):
+        return ch["via"]
+    return "local" if not ch.get("host") or ch["host"].startswith(("127.", "localhost")) else "cloudflare"
+
+
+def find_bin(name: str, given: str = "") -> str:
+    """a program's path: the config's, or where it usually is (a service's PATH is short)"""
+    for p in (given, shutil.which(name) or "", f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}", f"/usr/bin/{name}"):
+        if p and Path(p).is_file():
+            return p
+    return ""
+
+
+HEADER_RE = re.compile(r"[A-Za-z0-9-]{1,64}")           # a header's name as it goes into ngrok's and Caddy's files
+
+
+def id_headers(ch: dict) -> dict:
+    """the header mode's names of a chat: {email, name, secret_header, secret, strip: what a browser may not send by itself}"""
+    h = (ch.get("signin") or {}).get("header") or {}
+    name = lambda v, d: v if HEADER_RE.fullmatch(str(v or "")) else d
+    out = {"email": name(h.get("email"), "X-Forwarded-Email"), "name": name(h.get("name"), ""),
+           "secret_header": name(h.get("secret_header"), "X-Proxy-Secret"), "secret": str(h.get("secret") or "")}
+    out["strip"] = sorted({x.lower() for x in (out["email"], out["name"], out["secret_header"], "X-Forwarded-Email", "X-Forwarded-User") if x})
     return out
 
 
-def create_local(c: dict, title: str, slug: str) -> dict:
-    """a chat on this machine only (http://127.0.0.1:<port>): no domain, no Cloudflare, no sign-in"""
+def _reached(c: dict, how: str) -> list:
+    """the chats reached that way whose address can go into a config file: [(slug, chat)]"""
+    return [(s, ch) for s, ch in sorted(c["chats"].items()) if via(ch) == how and HOST_RE.fullmatch(ch.get("host") or "")]
+
+
+def ngrok_policy(ch: dict) -> dict:
+    """what ngrok does with a request before the chat sees it: a browser's own identity headers are taken off; when the chat's
+    sign-in is "a reverse proxy" (header), ngrok signs the person in and says who it is - everywhere but at the agents' doors"""
+    h = id_headers(ch)
+    rules = [{"actions": [{"type": "remove-headers", "config": {"headers": h["strip"]}}]}]
+    if (ch.get("signin") or {}).get("mode") == "header":
+        prov = ch.get("ngrok_oauth") if ch.get("ngrok_oauth") in NGROK_OAUTH else "google"
+        add = {h["email"]: "${actions.ngrok.oauth.identity.email}"}
+        if h["name"]:
+            add[h["name"]] = "${actions.ngrok.oauth.identity.name}"
+        if h["secret"]:
+            add[h["secret_header"]] = h["secret"]
+        rules.append({"expressions": [f"!req.url.path.startsWith('{p}')" for p in OPEN_PATHS],
+                      "actions": [{"type": "oauth", "config": {"provider": prov}}, {"type": "add-headers", "config": {"headers": add}}]})
+    return {"on_http_request": rules}
+
+
+def ngrok_text(c: dict) -> str:
+    """the ngrok agent's config (version 3) for every chat reached through it; '' with none or no authtoken.
+    Written as JSON, which YAML reads"""
+    eps = [{"name": slug, "url": f"https://{ch['host']}", "upstream": {"url": f"http://127.0.0.1:{ch['port']}"}, "traffic_policy": ngrok_policy(ch)}
+           for slug, ch in _reached(c, "ngrok")]
+    tok = (c.get("ngrok") or {}).get("authtoken") or ""
+    return json.dumps({"version": 3, "agent": {"authtoken": tok}, "endpoints": eps}, indent=1) + "\n" if eps and tok else ""
+
+
+def caddy_text(c: dict) -> str:
+    """the Caddyfile of every chat on an own domain: its sites only, so another Caddyfile can `import` it"""
+    return "\n".join(f"# {slug}\n{ch['host']} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{int(ch['port'])} {{\n"
+                     + "".join(f"\t\theader_up -{x}\n" for x in id_headers(ch)["strip"]) + "\t}\n}\n" for slug, ch in _reached(c, "caddy"))
+
+
+def aux_name(kind: str) -> str:
+    return f"game.lagom.{kind}-{ENV_ID}" if MAC else f"lagomchat-{kind}-{ENV_ID}"
+
+
+def aux_text(kind: str, argv: list[str]) -> str:
+    log = CFG_DIR / f"{kind}.log"
+    if MAC:
+        return plistlib.dumps({"KeepAlive": True, "Label": aux_name(kind), "ProgramArguments": argv, "RunAtLoad": True,
+                               "EnvironmentVariables": {"HOME": str(HOME)}, "StandardErrorPath": str(log), "StandardOutPath": str(log)}).decode()
+    return (f"[Unit]\nDescription=LagomChat {kind}\nAfter=network-online.target\n\n[Service]\nExecStart={' '.join(argv)}\n"
+            f"Restart=always\nRestartSec=3\nStandardOutput=append:{log}\nStandardError=append:{log}\n\n[Install]\nWantedBy=default.target\n")
+
+
+def _aux(kind: str, files: dict, argv: list[str] | None, changed: bool = False) -> None:
+    """one of the two services and its files ({path: (text, mode)}): there and current when argv is given, else gone"""
+    svc = {"service": aux_name(kind)}
+    sf = service_file(kind, svc)
+    if argv:
+        for f, (text, mode) in files.items():
+            changed |= _write(f, text, mode)
+        if _write(sf, aux_text(kind, argv)):
+            changed = True
+            if not MAC:
+                _run("systemctl", "--user", "daemon-reload")
+        if changed:
+            service(kind, svc, "restart")
+    elif sf.exists():
+        service(kind, svc, "stop")
+        sf.unlink(missing_ok=True)
+
+
+def front_doors(c: dict) -> None:
+    ng, cd = ngrok_text(c), caddy_text(c)
+    nb = find_bin("ngrok", c["ngrok"].get("bin") or "")
+    f = CFG_DIR / "ngrok.yml"
+    _aux("ngrok", {f: (ng, 0o600)}, [nb, "start", "--all", "--config", str(f), "--log", "stdout"] if ng and nb else None)
+    if not ng:
+        _rm(f)
+    # Caddy: the sites' file is always written (another Caddy may import it); our own service only when asked for
+    site, run = CFG_DIR / "Caddyfile", CFG_DIR / "Caddyfile.run"
+    site_changed = _write(site, cd) if cd else _rm(site)
+    cb = find_bin("caddy", c["caddy"].get("bin") or "")
+    em = c["caddy"].get("email") or c.get("owner_email") or ""
+    em = em if re.fullmatch(r"[^@\s{}]+@[^@\s{}]+", em) else ""
+    top = (f"{{\n\temail {em}\n}}\n" if em else "") + f"import {site}\n"
+    _aux("caddy", {run: (top, None)}, [cb, "run", "--config", str(run), "--adapter", "caddyfile"] if cd and cb and c["caddy"].get("run") else None, site_changed)
+
+
+def fronts(c: dict) -> dict:
+    """for the manager's page: what is there of ngrok and Caddy"""
+    return {"ngrok": {"bin": find_bin("ngrok", c["ngrok"].get("bin") or ""), "token": bool(c["ngrok"].get("authtoken"))},
+            "caddy": {"bin": find_bin("caddy", c["caddy"].get("bin") or ""), "file": str(CFG_DIR / "Caddyfile"), "run": bool(c["caddy"].get("run"))},
+            "oauth": list(NGROK_OAUTH)}
+
+
+def create_remote(c: dict, title: str, slug: str, how: str, host: str) -> dict:
+    """a chat reached through ngrok (host: the ngrok domain) or on an own domain behind Caddy (host: the name that points here).
+    Sign-in is on from the start: ngrok signs people in (Google) and says who they are; behind Caddy the chat signs in itself"""
+    host = re.sub(r"^https?://", "", (host or "").strip().lower()).strip("/")
+    if how == "caddy" and host and "." not in host and c.get("domain"):
+        host = f"{host}.{c['domain']}"                    # a bare name: under the machine's domain
+    if not HOST_RE.fullmatch(host):
+        raise Fail("the chat's address, please: " + ("your ngrok domain, e.g. name.ngrok-free.app" if how == "ngrok" else "a domain name that points to this machine, e.g. chat.example.com"))
+    if any(ch.get("host") == host for ch in c["chats"].values()):
+        raise Fail(f"{host} is another chat's address")
+    if how == "ngrok" and not (c["ngrok"].get("authtoken") and find_bin("ngrok", c["ngrok"].get("bin") or "")):
+        raise Fail("ngrok is not set up: install it and put its authtoken into Settings - ngrok")
+    if not (c.get("owner_email") or ""):
+        raise Fail("the owner's email first (Settings): a chat on the internet has an owner")
+    signin = {"mode": "header", "header": {"email": "X-Lagom-Email", "name": "X-Lagom-Name", "secret_header": "X-Lagom-Secret",
+                                           "secret": secrets.token_urlsafe(32), "logout": "/ngrok/logout"}} if how == "ngrok" else {"mode": "oauth"}
+    # no name given: the address's first part
+    return {**_create(c, title, slug or ("" if title.strip() else host.split(".")[0]), host=host, via=how, auth=True, signin=signin), "via": how}
+
+
+SERVER_CODE_NOT = {"manager.py", "chats.py", "lagomcfg.py", "people.py"}     # the rest of the working copy's .py is a chat server's code
+
+
+def code_time() -> float:
+    """when the chat server's code on disk last changed"""
+    return max((f.stat().st_mtime for f in REPO.glob("*.py") if f.name not in SERVER_CODE_NOT), default=0.0)
+
+
+def started(port: int) -> float:
+    """when the chat server on that port began, by its own /healthz; 0: it does not say (a server older than this question)"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1.5) as r:
+            m = re.search(r"started (\d+)", r.read(200).decode(errors="replace"))
+            return float(m.group(1)) if m else 0.0
+    except (OSError, ValueError):
+        return 0.0
+
+
+def status(c: dict) -> list[dict]:
+    out, code = [], code_time()
+    for slug, ch in sorted(c["chats"].items(), key=lambda kv: (not kv[1].get("main"), kv[1].get("created") or 0)):
+        out.append({"slug": slug, "title": _read(Path(ch.get("data") or "/nonexistent") / "title.txt") or ch.get("title") or slug, "url": chat_url(ch), "port": ch["port"],
+                    "main": bool(ch.get("main")), "running": listening(ch["port"]), "local": via(ch) == "local", "via": via(ch)})
+        # runs code older than what is on disk now: a server.py change waits for this chat's restart
+        out[-1]["stale"] = out[-1]["running"] and started(ch["port"]) < code
+    return out
+
+
+def _create(c: dict, title: str, slug: str, **more) -> dict:
+    """a new chat: its folders, its place in the config, its service started"""
     import chats as cz
     title, slug = cz.names(title, slug)
     if slug in c["chats"]:
@@ -285,7 +476,7 @@ def create_local(c: dict, title: str, slug: str) -> dict:
     if conf.exists() or data.exists():
         raise Fail(f"{conf} or {data} exists already")
     ch = {**json.loads(json.dumps(CHAT_DEFAULTS)), "title": title, "host": f"127.0.0.1:{port}", "port": port,
-          "conf": str(conf), "data": str(data), "created": round(time.time()), "main": not c["chats"]}
+          "conf": str(conf), "data": str(data), "created": round(time.time()), "main": not c["chats"], **more}
     c["chats"][slug] = ch
     save(c)
     data.mkdir(parents=True, exist_ok=True)
@@ -295,6 +486,11 @@ def create_local(c: dict, title: str, slug: str) -> dict:
     if not wait_port(port, True):
         raise Fail(f"the server did not start: see {log_file(slug, ch)}")
     return {"slug": slug, "url": chat_url(ch)}
+
+
+def create_local(c: dict, title: str, slug: str) -> dict:
+    """a chat on this machine only (http://127.0.0.1:<port>): no domain, no Cloudflare, no sign-in"""
+    return _create(c, title, slug)
 
 
 def delete_local(c: dict, slug: str) -> dict:

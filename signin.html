@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>LagomChat</title>
+<style>
+  :root { --bg: #15161c; --panel: #1d1f27; --line: #2c2f3a; --text: #e8e2d6; --muted: #a09a90; --accent: #e0a458; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f4f1ea; --panel: #ffffff; --line: #d9d4c9; --text: #24221e; --muted: #6d675d; --accent: #a8641a; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 "Fira Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 16px; }
+  main { width: 100%; max-width: 360px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 28px 24px 22px; }
+  .mark { width: 44px; height: 44px; margin: 0 auto 14px; display: block; color: var(--accent); }
+  h1 { margin: 0; font-size: 22px; font-weight: 600; text-align: center; overflow-wrap: anywhere; }
+  .sub { margin: 4px 0 22px; text-align: center; color: var(--muted); font-size: 14px; }
+  a.btn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 14px; margin-top: 10px; border: 1px solid var(--line); border-radius: 10px;
+          background: var(--bg); color: var(--text); text-decoration: none; font-weight: 500; transition: border-color .12s, transform .05s; }
+  a.btn:hover, a.btn:focus-visible { border-color: var(--accent); outline: none; }
+  a.btn:active { transform: translateY(1px); }
+  a.btn svg { width: 20px; height: 20px; flex: none; }
+  .or { display: flex; align-items: center; gap: 10px; margin: 18px 0 8px; color: var(--muted); font-size: 13px; }
+  .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .note { margin: 20px 0 0; text-align: center; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <svg class="mark" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M8 10h32a4 4 0 0 1 4 4v18a4 4 0 0 1-4 4H22l-10 8v-8H8a4 4 0 0 1-4-4V14a4 4 0 0 1 4-4z"/>
+  </svg>
+  <h1>LagomChat</h1>
+  <p class="sub" data-t="signin">Sign in</p>
+
+  <a class="btn" href="in/google">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.5a5.5 5.5 0 0 1-2.4 3.6v3h3.9c2.3-2.1 3.5-5.2 3.5-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.1 0-5.8-2.1-6.7-5H1.3v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.3a12 12 0 0 0 0 10.8l4-3.1z"/><path fill="#EA4335" d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.3 6.6l4 3.1c.9-2.9 3.6-4.9 6.7-4.9z"/></svg>
+    <span data-t="with" data-x="Google">Continue with Google</span>
+  </a>
+  <a class="btn" href="in/github">
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.200.8-.600v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.2c0 .3.2.7.8.6A11.5 11.5 0 0 0 12 .5z"/></svg>
+    <span data-t="with" data-x="GitHub">Continue with GitHub</span>
+  </a>
+
+  <div class="or" data-t="or">or</div>
+
+  <a class="btn" href="in/code">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 7 8.5 6 8.5-6"/></svg>
+    <span data-t="code">Code by email</span>
+  </a>
+  <a class="btn" href="in/passkey">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="4"/><path d="M2.5 20a5.5 5.5 0 0 1 9.5-3.8"/><circle cx="17.5" cy="11.5" r="2.5"/><path d="M17.5 14v6.5l1.8-1.5M17.5 18l1.5-1"/></svg>
+    <span data-t="passkey">Passkey</span>
+  </a>
+
+  <p class="note" data-t="note">The chat is by invitation: use the email you were invited with.</p>
+</main>
+<script>
+(() => {
+  // en, ru, cs, de, uk, be, es, sv, fr, it, pl, pt, zh
+  const L = ['en', 'ru', 'cs', 'de', 'uk', 'be', 'es', 'sv', 'fr', 'it', 'pl', 'pt', 'zh'];
+  const T = {
+    signin: ['Sign in', 'Вход', 'Přihlášení', 'Anmelden', 'Вхід', 'Уваход', 'Iniciar sesión', 'Logga in', 'Connexion', 'Accedi', 'Logowanie', 'Entrar', '登录'],
+    with: ['Continue with {x}', 'Войти через {x}', 'Pokračovat přes {x}', 'Weiter mit {x}', 'Увійти через {x}', 'Увайсці праз {x}', 'Continuar con {x}', 'Fortsätt med {x}', 'Continuer avec {x}', 'Continua con {x}', 'Kontynuuj przez {x}', 'Continuar com {x}', '使用 {x} 继续'],
+    or: ['or', 'или', 'nebo', 'oder', 'або', 'або', 'o', 'eller', 'ou', 'oppure', 'lub', 'ou', '或'],
+    code: ['Code by email', 'Код на почту', 'Kód e-mailem', 'Code per E-Mail', 'Код на пошту', 'Код на пошту', 'Código por correo', 'Kod via e-post', 'Code par e-mail', 'Codice via email', 'Kod e-mailem', 'Código por e-mail', '邮箱验证码'],
+    passkey: ['Passkey', 'Ключ доступа', 'Přístupový klíč', 'Passkey', 'Ключ доступу', 'Ключ доступу', 'Llave de acceso', 'Passkey', "Clé d'accès", 'Passkey', 'Klucz dostępu', 'Chave de acesso', '通行密钥'],
+    note: ['The chat is by invitation: use the email you were invited with.', 'Чат по приглашениям: входите с той почтой, на которую вас пригласили.', 'Chat je na pozvání: použijte e-mail, na který jste byli pozváni.', 'Der Chat ist nur auf Einladung: nutze die E-Mail, mit der du eingeladen wurdest.', 'Чат за запрошеннями: входьте з тією поштою, на яку вас запросили.', 'Чат па запрашэннях: уваходзьце з той поштай, на якую вас запрасілі.', 'El chat es por invitación: usa el correo con el que te invitaron.', 'Chatten är endast för inbjudna: använd den e-post du blev inbjuden med.', "Le chat est sur invitation : utilisez l'e-mail avec lequel vous avez été invité.", "La chat è su invito: usa l'email con cui sei stato invitato.", 'Czat jest na zaproszenie: użyj e-maila, na który przyszło zaproszenie.', 'O chat é por convite: use o e-mail com que foi convidado.', '本聊天仅限受邀者：请使用收到邀请的邮箱登录。'],
+  };
+  let lang = '';
+  try { lang = localStorage.getItem('ac_lang') || ''; } catch (e) {}
+  let i = L.indexOf((lang || navigator.language || 'en').slice(0, 2).toLowerCase());
+  if (i < 0) i = 0;
+  document.documentElement.lang = L[i];
+  for (const el of document.querySelectorAll('[data-t]')) {
+    el.textContent = T[el.dataset.t][i].replace('{x}', el.dataset.x || '');
+  }
+})();
+</script>
+</body>
+</html>

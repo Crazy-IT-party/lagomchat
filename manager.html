@@ -10,6 +10,35 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   main { max-width: 860px; margin: 0 auto; padding: 28px 16px 60px; }
+  /* with chats: the machine's settings on top, the chats as cards under them; a chat's settings open from its card */
+  main:has(#dash:not([hidden])) { max-width: 1300px; }
+  #settings > h2:first-child { margin-top: 0; }
+  #settings > .card { padding: 4px 16px; }
+  #settings > .card > details:first-child { border-top: 0; }
+  #settings .bar { margin-top: 0; }
+  #settings .msg { margin: 0 0 0 4px; min-height: 0; }
+  #paneChats { margin-top: 28px; }
+  #paneChats > .row:first-child { min-height: 34px; }
+  .gear { margin-left: auto; padding: 5px; border-color: transparent; color: var(--dim); flex: none; }
+  .gear:hover { color: var(--fg); }
+  .gear svg { width: 17px; height: 17px; }
+  dialog { width: min(880px, calc(100vw - 24px)); max-height: calc(100vh - 40px); padding: 0; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+  dialog[open] { display: flex; flex-direction: column; }
+  dialog::backdrop { background: rgba(0, 0, 0, .55); }
+  dialog > header { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  dialog > header h2 { margin: 0; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #dlgBody { overflow-y: auto; padding: 0 18px 14px; outline: none; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  dialog > footer { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line); }
+  dialog > footer .msg { margin: 0; min-height: 0; }
+  #list { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
+  #list .chat { flex: 1 1 250px; max-width: 420px; flex-direction: column; align-items: stretch; gap: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  #list .chat.is-stale { border-color: var(--warn, #e0a030); }
+  #list .chat .top { display: flex; align-items: flex-start; gap: 10px; }
+  #list .chat .top .dot { margin-top: 6px; }
+  #list .chat .nm { min-width: 0; overflow-wrap: anywhere; }
+  #list .chat .stale { display: block; margin: 2px 0 0; white-space: normal; }
+  #list .chat .row { margin-top: auto; gap: 6px; }
+  #list .chat .row button { padding: 5px 9px; font-size: 13px; }
   h1 { font-size: 22px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
   h2 { font-size: 16px; margin: 28px 0 10px; }
   .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; word-break: break-all; }
@@ -18,6 +47,7 @@
   .chat:last-child { border-bottom: 0; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); flex: none; }
   .dot.on { background: var(--ok); }
+  .stale { color: var(--warn, #e0a030); font-size: 12px; font-weight: 500; margin-left: 6px; white-space: nowrap; }
   .chat .nm { flex: 1; min-width: 180px; }
   .chat .nm b { display: block; }
   .chat .nm a { color: var(--dim); font-size: 13px; text-decoration: none; }
@@ -39,6 +69,9 @@
   @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
   .hint { color: var(--dim); font-size: 12px; margin-top: 3px; }
   details { border-top: 1px solid var(--line); padding: 10px 0; }
+  .signin { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 10px; padding: 4px 14px 10px; margin: 10px 0; }
+  .signin h3 { font-size: 14px; margin: 12px 0 2px; } .signin h4 { font-size: 13px; margin: 14px 0 0; color: var(--dim); grid-column: 1 / -1; }
+  .signin code { font-size: 12px; overflow-wrap: anywhere; }
   details > summary { cursor: pointer; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; }
   details > summary::before { content: ""; width: 8px; height: 8px; border-right: 2px solid var(--dim); border-bottom: 2px solid var(--dim); transform: rotate(-45deg); transition: transform .15s; }
   details[open] > summary::before { transform: rotate(45deg); }
@@ -51,7 +84,7 @@
   .seg input { width: auto; margin: 0 6px 0 0; }
   .seg small { display: block; color: var(--dim); font-size: 12px; margin-top: 2px; }
   [hidden] { display: none !important; }
-  .bar { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; border-top: 1px solid var(--line); margin-top: 16px; }
+  .bar { padding: 12px 0; border-top: 1px solid var(--line); margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -67,10 +100,18 @@
       <input id="wEmail" type="email" autocomplete="email" placeholder="you@example.com">
       <label for="wTitle">Chat name</label>
       <input id="wTitle" placeholder="My chat">
-      <label>Where</label>
-      <div class="seg">
-        <label><input type="radio" name="wWhere" value="local" checked>This computer only<small>http://127.0.0.1:&lt;port&gt;, no sign-in, nothing else needed</small></label>
-        <label><input type="radio" name="wWhere" value="domain">On my domain<small>https://&lt;name&gt;.&lt;domain&gt; through Cloudflare, sign-in by email</small></label>
+      <div data-where="w"></div>
+      <div id="wNgrok" hidden>
+        <label for="wNgTok">ngrok authtoken</label><input id="wNgTok" type="password" autocomplete="off">
+        <div class="hint">dashboard.ngrok.com, Your Authtoken. Sign in at the chat with the Google account of the email above: that one is the owner.</div>
+      </div>
+      <div id="wCaddy" hidden>
+        <label class="chk" id="wCdRunBox"><input type="checkbox" id="wCdRun">Run Caddy from here<span class="hint" id="wCdRunHint" style="margin:0 0 0 8px"></span></label>
+        <div class="grid">
+          <div><label for="wGId">Google client id (sign-in)</label><input id="wGId" autocomplete="off"></div>
+          <div><label for="wGSec">Google client secret</label><input id="wGSec" type="password" autocomplete="off"></div>
+        </div>
+        <div class="hint">console.cloud.google.com, Credentials, OAuth client (web); its redirect address: <code id="wGRedir">https://&lt;the chat&gt;/auth/google/callback</code>. Without a sign-in provider nobody gets into the chat, you too: GitHub and others are in the chat's settings afterwards.</div>
       </div>
       <div id="wDomain" hidden>
         <div class="grid">
@@ -88,29 +129,26 @@
 
   <!-- the chats -->
   <section id="dash" hidden>
+    <div id="settings"></div>
+    <div id="paneChats">
     <div class="row" style="justify-content:space-between"><h2 style="margin:0">Chats</h2>
-      <button type="button" id="newBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New chat</button></div>
-    <div class="card" style="padding:0;margin-top:10px" id="list"></div>
+      <span class="row"><button type="button" id="staleBtn" hidden></button>
+      <button type="button" id="newBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New chat</button></span></div>
+    <div id="list"></div>
     <div class="card" id="newCard" style="margin-top:12px" hidden>
       <div class="grid">
         <div><label for="nTitle">Chat name</label><input id="nTitle" placeholder="Book club"></div>
         <div><label for="nSlug">Subdomain (optional)</label><input id="nSlug" placeholder="made from the name"></div>
       </div>
-      <label>Where</label>
-      <div class="seg">
-        <label><input type="radio" name="nWhere" value="local" checked>This computer only<small>http://127.0.0.1:&lt;port&gt;</small></label>
-        <label><input type="radio" name="nWhere" value="domain" id="nDomRadio">On the domain<small id="nDomHint"></small></label>
-      </div>
+      <div data-where="n"></div>
       <div class="row" style="margin-top:14px"><button class="pri" id="nGo" type="button">Create and start</button><button type="button" id="nCancel">Cancel</button></div>
       <div class="msg" id="nMsg"></div>
     </div>
     <div class="msg" id="opMsg"></div>
-
-    <h2>Settings</h2>
-    <div class="card" id="settings"></div>
-    <div class="bar row"><button class="pri" id="saveBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>Save</button>
-      <span class="hint">Saved to the config; the chats whose settings changed restart by themselves.</span></div>
-    <div class="msg" id="saveMsg"></div>
+    </div>
+    <dialog id="dlg" aria-labelledby="dlgT"><header><h2 id="dlgT"></h2><span class="hint" id="dlgSub"></span></header>
+      <div id="dlgBody"></div>
+      <footer><button class="pri" id="dlgSave" type="button"></button><button type="button" id="dlgClose">Close</button><span class="msg" id="dlgMsg"></span><span class="hint" style="margin-left:auto">A save restarts this chat if its settings changed.</span></footer></dialog>
   </section>
 </main>
 <script>
@@ -119,7 +157,8 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const I = {
   open: '<path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
   play: '<path d="M7 5l12 7-12 7z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
-  re: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', del: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  re: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', ok: '<path d="M5 12l5 5L20 7"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>', del: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
 };
 const ico = n => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${I[n]}</svg>`;
 let S = null;
@@ -140,13 +179,24 @@ async function load(keepForm) {
   if (!running && $('#wEmail').value === '') $('#wEmail').value = S.config.owner_email || '';
   paintList();
   if (!keepForm) paintSettings();
+  const ng = S.fronts.ngrok, ngHint = 'a tunnel from your ngrok domain, sign-in with Google';
+  $('#wDomHint').textContent = 'https://<name>.<domain> through a Cloudflare tunnel, sign-in by email';
   $('#nDomHint').textContent = S.cloudflare_ready ? `https://<name>.${S.config.domain}` : 'set up Cloudflare in Settings first';
   $('#nDomRadio').disabled = !S.cloudflare_ready;
+  $('#wNgHint').textContent = ng.bin ? ngHint : 'install ngrok first (ngrok.com/download), then open this page again';
+  $('#wNgRadio').disabled = !ng.bin;
+  $('#nNgHint').textContent = !ng.bin ? 'install ngrok first' : !ng.token ? 'put its authtoken into Settings first' : ngHint;
+  $('#nNgRadio').disabled = !(ng.bin && ng.token);
+  $('#wCdRun').disabled = !S.fronts.caddy.bin; $('#wCdRun').checked = !!S.fronts.caddy.bin && !$('#wCdRun').dataset.set; $('#wCdRun').dataset.set = 1;
+  $('#wCdRunHint').textContent = S.fronts.caddy.bin ? '' : 'Caddy is not installed here: install it, or import the sites into a Caddy of your own (Settings)';
 }
 function paintList() {
-  $('#list').innerHTML = S.chats.map(c => `<div class="chat" data-slug="${esc(c.slug)}">
-    <span class="dot${c.running ? ' on' : ''}" title="${c.running ? 'running' : 'stopped'}"></span>
-    <div class="nm"><b>${esc(c.title)}${c.main ? ' <span class="hint">main</span>' : ''}</b><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url.replace(/^https?:\/\//, ''))}</a> <span class="hint">:${c.port}</span></div>
+  const stale = S.chats.filter(c => c.stale);
+  $('#staleBtn').hidden = !stale.length;
+  $('#staleBtn').innerHTML = `${ico('re')}Restart the ${stale.length} with older code`;
+  $('#list').innerHTML = S.chats.map(c => `<div class="chat${c.stale ? ' is-stale' : ''}" data-slug="${esc(c.slug)}">
+    <div class="top"><span class="dot${c.running ? ' on' : ''}" title="${c.running ? 'running' : 'stopped'}"></span>
+    <div class="nm"><b>${esc(c.title)}${c.main ? ' <span class="hint">main</span>' : ''}</b><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url.replace(/^https?:\/\//, ''))}</a> <span class="hint">:${c.port}${VIA[c.via] ? ' · ' + VIA[c.via] : ''}</span>${c.stale ? '<span class="stale" title="The server\'s code changed after this chat started: it runs the older code until it restarts">needs a restart: the code changed</span>' : ''}</div><button type="button" class="gear" data-cfg title="Settings" aria-label="Settings">${ico('gear')}</button></div>
     <div class="row">
       ${c.running ? `<a href="${esc(c.url)}" target="_blank" rel="noopener"><button type="button">${ico('open')}Open</button></a>
         <button type="button" data-op="restart">${ico('re')}Restart</button><button type="button" data-op="stop">${ico('stop')}Stop</button>`
@@ -160,29 +210,94 @@ const F = (id, label, val, o = {}) => `<div><label for="${id}">${esc(label)}</la
   ? `<textarea id="${id}" data-k="${esc(o.k)}" data-t="${o.t || 'lines'}">${esc(val)}</textarea>`
   : `<input id="${id}" data-k="${esc(o.k)}" data-t="${o.t || 'str'}" type="${o.type || 'text'}" value="${esc(val)}" autocomplete="off"${o.ph ? ` placeholder="${esc(o.ph)}"` : ''}>`}${o.hint ? `<div class="hint">${esc(o.hint)}</div>` : ''}</div>`;
 const lines = a => (a || []).join('\n');
+const VIA = { ngrok: 'ngrok', caddy: 'own domain' };
+// a chat's sign-in (auth.py): who proves a person's email, and that way's own settings; only the picked way's fields show
+const SM = [['', 'Cloudflare Access when the owner\'s email is set, else the chat\'s own sign-in'], ['access', 'Cloudflare Access'],
+  ['oauth', 'The chat\'s own sign-in: Google, GitHub, OpenID Connect'], ['header', 'A reverse proxy signs people in (a header)']];
+function signinForm(p, k, ch) {
+  const si = ch.signin || {}, pv = si.providers || {}, hd = si.header || {}, mode = si.mode || '';
+  const base = `${(ch.host || '').startsWith('127.') ? 'http' : 'https'}://${ch.host || '<the chat>'}/auth/`;
+  const prov = (id, title, extra = '') => { const v = pv[id] || {}, kk = x => k(`signin.providers.${id}.${x}`); return `
+      <h4>${title}</h4>${extra}
+      ${F(p + 'si_' + id + '_id', 'Client id', v.client_id, { k: kk('client_id') })}
+      ${F(p + 'si_' + id + '_sec', 'Client secret', v.client_secret, { k: kk('client_secret'), type: 'password' })}
+      ${F(p + 'si_' + id + '_dom', 'Only emails of these domains (none: any)', lines(v.domains), { k: kk('domains'), area: 1,
+        hint: id === 'google' ? 'gmail.com: Gmail accounts only; another domain: that Google Workspace\'s accounts only' : 'one per line' })}
+      <div><label>Redirect address to register there</label><div class="hint"><code>${esc(base + id + '/callback')}</code></div></div>`; };
+  const o = pv.oidc || {};
+  return `<div class="signin"><h3>Sign-in</h3>
+      <div><label for="${p}si_mode">Who proves a person's email</label><select id="${p}si_mode" data-k="${esc(k('signin.mode'))}" data-t="str" data-smsel>
+        ${SM.map(([v, t]) => `<option value="${v}"${v === mode ? ' selected' : ''}>${esc(t)}</option>`).join('')}</select>
+        <div class="hint">The owner is the owner's email in every way; the guests' lists below say who else is let in.</div></div>
+      <div class="grid" data-sm="oauth"${mode === 'oauth' ? '' : ' hidden'}>
+        ${prov('google', 'Google')}
+        ${prov('github', 'GitHub')}
+        ${prov('oidc', 'Another provider (OpenID Connect: Keycloak, Authentik, Entra, Okta ...)', `
+      ${F(p + 'si_oidc_name', 'Name on the button', o.name, { k: k('signin.providers.oidc.name'), ph: 'Oidc' })}
+      ${F(p + 'si_oidc_iss', 'Issuer address', o.issuer, { k: k('signin.providers.oidc.issuer'), ph: 'https://id.example.com/realms/team' })}`)}
+        <div><label>&nbsp;</label><label class="chk"><input type="checkbox" data-k="${esc(k('signin.providers.oidc.trust_email'))}" data-t="bool"${o.trust_email ? ' checked' : ''}>Take its emails without "email_verified" (Entra)</label></div>
+        <input type="hidden" data-k="${esc(k('signin.providers.oidc.type'))}" data-t="str" value="oidc">
+      </div>
+      <div class="grid" data-sm="header"${mode === 'header' ? '' : ' hidden'}>
+        ${F(p + 'si_h_em', 'Header with the email', hd.email, { k: k('signin.header.email'), ph: 'X-Forwarded-Email' })}
+        ${F(p + 'si_h_nm', 'Header with the name', hd.name, { k: k('signin.header.name'), ph: 'none: the email\'s first part' })}
+        ${F(p + 'si_h_from', 'The proxy\'s addresses', lines(hd.from), { k: k('signin.header.from'), area: 1, hint: 'none: this machine (127.0.0.1, ::1)' })}
+        ${F(p + 'si_h_out', 'The proxy\'s sign-out path', hd.logout, { k: k('signin.header.logout'), ph: '/oauth2/sign_out' })}
+        ${F(p + 'si_h_sh', 'Shared secret: header', hd.secret_header, { k: k('signin.header.secret_header'), ph: 'X-Proxy-Secret' })}
+        ${F(p + 'si_h_sv', 'Shared secret: value', hd.secret, { k: k('signin.header.secret'), type: 'password', hint: 'the proxy adds it; set it when anything else on the machine reaches the chat\'s port' })}
+        <div class="hint" style="grid-column:1/-1">The proxy must take these headers off what a browser sends, or anybody is anybody.</div>
+      </div></div>`;
+}
+document.addEventListener('change', e => {
+  if (!e.target.matches('[data-smsel]')) return;
+  for (const g of e.target.closest('.signin').querySelectorAll('[data-sm]')) g.hidden = g.dataset.sm !== e.target.value;
+});
 function paintSettings() {
   const c = S.config, cf = c.cloudflare;
-  let h = `<details open><summary>This machine</summary><div class="grid">
+  const was = [...document.querySelectorAll('#settings details[data-d]')], open = new Set(was.filter(d => d.open).map(d => d.dataset.d));
+  const isOpen = d => open.has(d) ? ' open' : '';        // a repaint (after Save) keeps what was open
+  const pageTop = scrollY;
+  let h = `<h2>This machine</h2><div class="card"><details data-d=":machine"${isOpen(':machine')}><summary>Owner and domains</summary><div class="grid">
     ${F('g_owner', "Owner's email", c.owner_email, { k: 'owner_email', type: 'email', hint: 'the owner of every chat, unless a chat says otherwise' })}
     ${F('g_dom', 'Domain for new chats', c.domain, { k: 'domain', ph: 'example.com' })}
     ${F('g_doms', 'Domains the chats live on', lines(c.domains), { k: 'domains', area: 1, hint: 'one per line' })}
     ${F('g_moved', 'Moved from (redirect to the domain)', lines(c.moved_from), { k: 'moved_from', area: 1, hint: 'a page opened on <name>.<old> goes to <name>.<domain>' })}
   </div></details>
-  <details><summary>Cloudflare</summary><div class="grid">
+  <details data-d=":cloudflare"${isOpen(':cloudflare')}><summary>Cloudflare</summary><div class="grid">
     ${F('cf_tok', 'API token', cf.token, { k: 'cloudflare.token', type: 'password' })}
     ${F('cf_acc', 'Account id', cf.account, { k: 'cloudflare.account' })}
     ${F('cf_tun', 'Tunnel id (cloudflared on this machine)', cf.tunnel, { k: 'cloudflare.tunnel' })}
     ${F('cf_idp', 'Access login method id (one-time code by email)', cf.idp, { k: 'cloudflare.idp' })}
     ${F('cf_zones', 'Zones: domain=zone id', Object.entries(cf.zones || {}).map(([d, z]) => `${d}=${z}`).join('\n'), { k: 'cloudflare.zones', area: 1, t: 'map' })}
-  </div></details>`;
-  for (const [slug, ch] of Object.entries(c.chats)) {
-    const p = `c_${slug.replace(/[^a-z0-9]/g, '_')}_`, k = x => `chats.${slug}.${x}`, g = ch.guests || {};
-    h += `<details><summary>${esc(ch.title || slug)} <span class="hint">${esc(slug)}</span></summary><div class="grid">
+  </div></details>
+  <details data-d=":ngrok"${isOpen(':ngrok')}><summary>ngrok</summary><div class="grid">
+    ${F('ng_tok', 'Authtoken', c.ngrok.authtoken, { k: 'ngrok.authtoken', type: 'password', hint: 'dashboard.ngrok.com, Your Authtoken' })}
+    ${F('ng_bin', 'The ngrok program', c.ngrok.bin, { k: 'ngrok.bin', ph: S.fronts.ngrok.bin || 'not found: install ngrok' })}
+  </div><div class="hint">One ngrok agent serves every chat made with "ngrok"; it runs while there is one. Its config: .lagomchat/ngrok.yml</div></details>
+  <details data-d=":caddy"${isOpen(':caddy')}><summary>Own domain (Caddy)</summary><div class="grid">
+    <div><label>&nbsp;</label><label class="chk"><input type="checkbox" data-k="caddy.run" data-t="bool"${c.caddy.run ? ' checked' : ''}>Run Caddy from here for these chats</label>
+      <div class="hint">${S.fronts.caddy.bin ? 'needs ports 80 and 443 free on this machine' : 'Caddy is not installed here'}</div></div>
+    ${F('cd_em', 'Email for the certificates', c.caddy.email, { k: 'caddy.email', type: 'email', ph: c.owner_email })}
+    ${F('cd_bin', 'The caddy program', c.caddy.bin, { k: 'caddy.bin', ph: S.fronts.caddy.bin || 'not found' })}
+  </div><div class="hint">The chats' sites are written to <code>${esc(S.fronts.caddy.file)}</code>. A Caddy of your own takes them with the line <code>import ${esc(S.fronts.caddy.file)}</code> in its Caddyfile.</div></details>
+  <div class="bar row"><button class="pri" id="saveBtn" type="button">${ico('ok')}Save</button><span class="msg" id="saveMsg"></span><span class="hint" style="margin-left:auto">The chats these settings reach restart by themselves.</span></div>
+</div>`;
+  $('#settings').innerHTML = h;
+  scrollTo(0, pageTop);
+}
+// a chat's settings: the dialog its card's gear opens
+function chatForm(slug) {
+  const c = S.config, ch = c.chats[slug], p = `c_${slug.replace(/[^a-z0-9]/g, '_')}_`, k = x => `chats.${slug}.${x}`, g = ch.guests || {};
+  return `<div class="grid">
       ${F(p + 'title', 'Title', ch.title, { k: k('title') })}
       ${F(p + 'port', 'Port', ch.port, { k: k('port'), t: 'int', type: 'number' })}
       ${F(p + 'host', 'Address', ch.host, { k: k('host'), hint: 'set by Cloudflare when the chat was made' })}
       ${F(p + 'owner', "Owner's email (this chat)", ch.owner_email, { k: k('owner_email'), type: 'email', ph: c.owner_email })}
-      <div><label>&nbsp;</label><label class="chk"><input type="checkbox" data-k="${esc(k('auth'))}" data-t="bool"${ch.auth ? ' checked' : ''}>Sign-in required (Cloudflare Access email)</label></div>
+      <div><label>&nbsp;</label><label class="chk"><input type="checkbox" data-k="${esc(k('auth'))}" data-t="bool"${ch.auth ? ' checked' : ''}>Sign-in required</label></div>
+      ${signinForm(p, k, ch)}
+      ${ch.via === 'ngrok' ? `<div><label for="${p}ngo">ngrok signs people in with</label><select id="${p}ngo" data-k="${esc(k('ngrok_oauth'))}" data-t="str">
+        ${S.fronts.oauth.map(v => `<option value="${v === 'google' ? '' : v}"${(ch.ngrok_oauth || 'google') === v ? ' selected' : ''}>${v[0].toUpperCase() + v.slice(1)}</option>`).join('')}</select>
+        <div class="hint">while the sign-in above is "A reverse proxy": ngrok is that proxy. Another way above: ngrok only carries the traffic.</div></div>` : ''}
       ${F(p + 'rn', 'Names that mean the owner', lines(ch.reserved_names), { k: k('reserved_names'), area: 1, hint: 'agents may write --to <name>' })}
       ${F(p + 'ge', 'Guests: emails', lines(g.google_emails), { k: k('guests.google_emails'), area: 1 })}
       ${F(p + 'gd', 'Guests: whole email domains', lines(g.google_domains), { k: k('guests.google_domains'), area: 1 })}
@@ -198,13 +313,19 @@ function paintSettings() {
       ${F(p + 'ih', 'Away hidden after (s)', ch.idle_hide, { k: k('idle_hide'), t: 'num', type: 'number' })}
       ${F(p + 'at', 'Agents in a row before a pause (0: never)', ch.agent_turns ?? 10, { k: k('agent_turns'), t: 'num', type: 'number' })}
       ${F(p + 'py', 'Python', ch.python || '', { k: k('python'), ph: 'the manager\'s own' })}
-    </div><div class="hint">conf ${esc(ch.conf)} · data ${esc(ch.data)}</div></details>`;
-  }
-  $('#settings').innerHTML = h;
+    </div><div class="hint">conf ${esc(ch.conf)} · data ${esc(ch.data)}</div>`;
 }
-function collect() {
+let DLG = '', DIRTY = false;                             // the chat whose settings are open; something in them was changed and not saved
+function openChat(slug) {
+  const ch = S.config.chats[slug]; if (!ch) return;
+  DLG = slug; $('#dlgT').textContent = ch.title || slug; $('#dlgSub').textContent = slug + (ch.via ? ' · ' + (VIA[ch.via] || ch.via) : '');
+  $('#dlgBody').innerHTML = chatForm(slug); say('#dlgMsg', ''); DIRTY = false;
+  if (!$('#dlg').open) $('#dlg').showModal();
+}
+// the fields under `root` over the config as it is: the machine's card and a chat's dialog are saved each by itself
+function collect(root) {
   const c = JSON.parse(JSON.stringify(S.config));
-  for (const el of document.querySelectorAll('#settings [data-k]')) {
+  for (const el of $(root).querySelectorAll('[data-k]')) {
     const path = el.dataset.k.split('.'), t = el.dataset.t; let v;
     if (t === 'bool') v = el.checked;
     else if (t === 'int' || t === 'num') { v = Number(el.value); if (!isFinite(v)) throw new Error(`${el.dataset.k}: a number`); if (t === 'int') v = Math.round(v); }
@@ -213,6 +334,10 @@ function collect() {
     else v = el.value.trim();
     // a chat's slug may hold a dot-free name only, so the path is safe to walk
     let o = c; for (const p of path.slice(0, -1)) o = o[p] = o[p] ?? {}; o[path.at(-1)] = v;
+  }
+  for (const ch of Object.values(c.chats)) {             // the other provider's fixed type alone is no provider
+    const o = ch.signin?.providers?.oidc;
+    if (o && !o.client_id && !o.issuer && !o.name) delete ch.signin.providers.oidc;
   }
   return c;
 }
@@ -226,26 +351,83 @@ document.addEventListener('click', async e => {
   try { await api('api/op', { op, slug }); say('#opMsg', ''); } catch (x) { say('#opMsg', x.message, 'err'); }
   await load(true);
 });
-$('#saveBtn').onclick = async () => {
-  let c; try { c = collect(); } catch (x) { say('#saveMsg', x.message, 'err'); return; }
-  $('#saveBtn').disabled = true; say('#saveMsg', 'Saving...');
-  try { const r = await api('api/save', { config: c }); say('#saveMsg', r.restarted.length ? `Saved; restarted: ${r.restarted.join(', ')}` : 'Saved; nothing to restart', 'ok'); await load(); }
-  catch (x) { say('#saveMsg', x.message, 'err'); }
-  $('#saveBtn').disabled = false;
+// every chat that runs older code, one after another (the main one last: the owner's own page goes down for its seconds)
+$('#staleBtn').onclick = async () => {
+  const stale = S.chats.filter(c => c.stale).sort((a, b) => a.main - b.main);
+  if (!stale.length || !confirm(`Restart ${stale.length} chat${stale.length > 1 ? 's' : ''}? Each is down for a few seconds; the agents' listeners come back by themselves.\n\n${stale.map(c => c.title).join('\n')}`)) return;
+  document.querySelectorAll('[data-op], #staleBtn').forEach(x => x.disabled = true);
+  const failed = [];
+  for (const [i, c] of stale.entries()) {
+    say('#opMsg', `restart ${c.slug} (${i + 1} of ${stale.length})...`);
+    try { const r = await api('api/op', { op: 'restart', slug: c.slug }); if (!r.running) failed.push(c.slug); } catch (x) { failed.push(`${c.slug}: ${x.message}`); }
+  }
+  $('#staleBtn').disabled = false;
+  say('#opMsg', failed.length ? `Not running after the restart: ${failed.join(', ')}` : `Restarted: ${stale.length}`, failed.length ? 'err' : 'ok');
+  await load(true);
 };
+async function saveFrom(root, btn, msg) {
+  let c; try { c = collect(root); } catch (x) { say(msg, x.message, 'err'); return false; }
+  btn.disabled = true; say(msg, 'Saving...');
+  try { const r = await api('api/save', { config: c }); await load(root !== '#settings'); say(msg, r.restarted.length ? `Saved; restarted: ${r.restarted.join(', ')}` : 'Saved; nothing to restart', 'ok'); return true; }
+  catch (x) { say(msg, x.message, 'err'); return false; }
+  finally { btn.disabled = false; }
+}
+document.addEventListener('click', async e => {
+  if (e.target.closest('#saveBtn')) { await saveFrom('#settings', e.target.closest('#saveBtn'), '#saveMsg'); return; }
+  const g = e.target.closest('[data-cfg]'); if (g) openChat(g.closest('[data-slug]').dataset.slug);
+});
+$('#dlgSave').onclick = async () => {                   // saved: the dialog stays, with what the config holds now
+  const top = $('#dlgBody').scrollTop;
+  if (await saveFrom('#dlgBody', $('#dlgSave'), '#dlgMsg')) { const m = $('#dlgMsg').textContent; openChat(DLG); say('#dlgMsg', m, 'ok'); $('#dlgBody').scrollTop = top; }
+};
+$('#dlgSave').innerHTML = ico('ok') + 'Save';
+// Close, Esc, a click on the backdrop: what was typed and not saved is not dropped without a word
+const dlgShut = () => { if (!DIRTY || confirm('Close without saving the changes?')) $('#dlg').close(); };
+for (const ev of ['input', 'change']) $('#dlgBody').addEventListener(ev, () => { DIRTY = true; });
+$('#dlgClose').onclick = dlgShut;
+$('#dlg').addEventListener('cancel', e => { e.preventDefault(); dlgShut(); });
+$('#dlg').addEventListener('click', e => { if (e.target === $('#dlg')) dlgShut(); });
 $('#newBtn').onclick = () => { $('#newCard').hidden = !$('#newCard').hidden; $('#nTitle').focus(); };
 $('#nCancel').onclick = () => { $('#newCard').hidden = true; };
 $('#nGo').onclick = async () => {
   $('#nGo').disabled = true; say('#nMsg', 'Creating...');
   try {
-    const r = await api('api/new', { title: $('#nTitle').value, slug: $('#nSlug').value, where: document.querySelector('[name=nWhere]:checked').value });
+    const r = await api('api/new', { title: $('#nTitle').value, slug: $('#nSlug').value, host: $('#nHost').value, where: placeOf('n') });
     say('#nMsg', `Ready: ${r.url}`, 'ok'); $('#nTitle').value = $('#nSlug').value = ''; await load();
   } catch (x) { say('#nMsg', x.message, 'err'); }
   $('#nGo').disabled = false;
 };
-for (const r of document.querySelectorAll('[name=wWhere]')) r.onchange = () => { $('#wDomain').hidden = document.querySelector('[name=wWhere]:checked').value !== 'domain'; };
+// where a chat is reached: the same choice in the wizard (w) and in New chat (n). ngrok and an own domain: the address is the user's to give
+const PLACE_HOST = {
+  ngrok: ['Your ngrok domain', 'name.ngrok-free.app', 'dashboard.ngrok.com, Domains. A free account has one, so one chat; its pages show ngrok\'s warning once a week. People sign in with Google at ngrok; you let them in on the chat\'s page.'],
+  caddy: ['Domain name of the chat', 'chat.example.com', 'Its DNS record must point to this machine and ports 80 and 443 must reach Caddy.'] };
+const placeOf = p => document.querySelector(`[name=${p}Where]:checked`).value;
+function placePicked(p) {
+  const w = placeOf(p), h = PLACE_HOST[w];
+  $(`#${p}HostBox`).hidden = !h;
+  if (h) {
+    $(`#${p}HostLabel`).textContent = h[0]; $(`#${p}Host`).placeholder = h[1];
+    $(`#${p}HostHint`).textContent = h[2] + (p === 'n' && w === 'caddy' ? ' After the chat is made, set up its Sign-in (Google, GitHub ...) in the chat\'s settings: until then nobody gets in.' : '');
+  }
+  if (p === 'w') { $('#wDomain').hidden = w !== 'domain'; $('#wNgrok').hidden = w !== 'ngrok'; $('#wCaddy').hidden = w !== 'caddy'; }
+}
+for (const box of document.querySelectorAll('[data-where]')) {
+  const p = box.dataset.where;
+  box.innerHTML = `<label>Where</label>
+    <div class="seg">
+      <label><input type="radio" name="${p}Where" value="local" checked>This computer only<small>http://127.0.0.1:&lt;port&gt;, no sign-in</small></label>
+      <label><input type="radio" name="${p}Where" value="domain" id="${p}DomRadio">Cloudflare<small id="${p}DomHint"></small></label>
+    </div>
+    <div class="seg">
+      <label><input type="radio" name="${p}Where" value="ngrok" id="${p}NgRadio">ngrok<small id="${p}NgHint"></small></label>
+      <label><input type="radio" name="${p}Where" value="caddy">Own domain (Caddy)<small>a name that points to this machine; the chat signs people in itself</small></label>
+    </div>
+    <div id="${p}HostBox" hidden><label for="${p}Host" id="${p}HostLabel"></label><input id="${p}Host" autocomplete="off"><div class="hint" id="${p}HostHint"></div></div>`;
+  box.onchange = e => { if (e.target.name === p + 'Where') placePicked(p); };
+}
+$('#wHost').oninput = () => { $('#wGRedir').textContent = `https://${$('#wHost').value.trim().toLowerCase() || '<the chat>'}/auth/google/callback`; };
 $('#wGo').onclick = async () => {
-  const where = document.querySelector('[name=wWhere]:checked').value, email = $('#wEmail').value.trim();
+  const where = placeOf('w'), email = $('#wEmail').value.trim();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { say('#wMsg', 'Your email, please', 'err'); return; }
   $('#wGo').disabled = true; say('#wMsg', 'Creating...');
   try {
@@ -255,7 +437,20 @@ $('#wGo').onclick = async () => {
       c.cloudflare.token = $('#wTok').value.trim();
       await api('api/save', { config: c });
     }
-    const r = await api('api/new', { owner_email: email, title: $('#wTitle').value || 'Chat', slug: $('#wSlug').value, where });
+    if (where === 'ngrok' || where === 'caddy') {        // what the chat needs of the machine goes into the config first
+      const c = JSON.parse(JSON.stringify(S.config));
+      c.owner_email = email;
+      if (where === 'ngrok') { if (!$('#wNgTok').value.trim() && !c.ngrok.authtoken) throw new Error('The ngrok authtoken, please'); c.ngrok.authtoken = $('#wNgTok').value.trim() || c.ngrok.authtoken; }
+      else { if ($('#wGId').value.trim() && !$('#wGSec').value.trim()) throw new Error('The Google client secret, please'); c.caddy.run = $('#wCdRun').checked; }
+      await api('api/save', { config: c });
+    }
+    const r = await api('api/new', { owner_email: email, title: $('#wTitle').value || 'Chat', slug: where === 'domain' ? $('#wSlug').value : '', where,
+      host: $('#wHost').value });
+    if (where === 'caddy' && $('#wGId').value.trim()) {  // the owner's way in: Google, for the chat that was just made
+      const c = (await api('api/state')).config;
+      c.chats[r.slug].signin = { mode: 'oauth', providers: { google: { client_id: $('#wGId').value.trim(), client_secret: $('#wGSec').value.trim() } } };
+      await api('api/save', { config: c });
+    }
     say('#wMsg', `Ready: ${r.url}`, 'ok'); if (window.__acApp) { location.href = r.url; return; } window.open(r.url, '_blank'); await load();
   } catch (x) { say('#wMsg', x.message, 'err'); }
   $('#wGo').disabled = false;

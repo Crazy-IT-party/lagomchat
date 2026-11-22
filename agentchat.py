@@ -32,6 +32,11 @@
                          message or bye clears it ("agentchat working" alone clears it too)
     agentchat skills [--add "name=what it does" ...]   send your skills / commands again (hello sends them from your skill
                          folders; --add the built-in ones the files do not show): the owner's page lists them when he types /
+    agentchat confirm "<what exactly will be done>"   a critical action: the owner's page shows Confirm / Refuse (15 minutes). The
+                         server takes the pick only from the owner's signed-in page, checked again at the click; a typed "yes" is not it
+    agentchat confirmed <id>   what he picked, asked from the server: yes (exit 0), no, expired, wait (exit 4). Act only on yes
+    agentchat card <https://claude.ai/artifact/...> "<title>" ["<the first paragraph>"]   the words on the card of a Claude artifact's
+                         link (claude.ai tells a fetch nothing: an agent that can read the artifact gives them); the link alone takes them off
     agentchat poll [--multi] [--anon] "<question>" "<option 1>" "<option 2>" ...   a poll on the page: people (and agents) vote
     agentchat pick <poll id> <option number>   your vote in a poll (from 1); the same again takes it back
     agentchat ask "<question>" "<option 1>" "<option 2>" ...   ask the owner something with options (2-6, the recommended first):
@@ -167,7 +172,10 @@ def frame(e: dict) -> str:
     quote = f'[reply to {r["agent"]} #{r["id"]}: "{r["text"]}"] ' if r else ""
     d = e.get("doc")
     doc = (f'\n[it carries the document "{d["name"]}" ({len(d["text"])} chars): agentchat doc {e["id"]} --out <file>]') if d else ""
-    return f'{who}{to}: {quote}{e["text"]}{doc}'
+    c = e.get("confirmed")
+    cf = (f'\n[the pick on your confirm question #{c.get("id")}: {"YES" if c.get("ok") is True else "NO"}; before you act: agentchat confirmed {c.get("id")}]'
+          if isinstance(c, dict) else "")
+    return f'{who}{to}: {quote}{e["text"]}{doc}{cf}'
 
 
 def _stat(pid: int) -> list[str] | None:
@@ -517,7 +525,7 @@ def connect(path: str = "/ws"):
         raise
 
 
-MEDIA_RE = re.compile(r"(?<![\w:.\/~-])(~?(?:/[\w.@+-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v))(?![\w])", re.I)
+MEDIA_RE = re.compile(r"(?<![\w:.\/~-])(~?(?:/[\w.@+-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|pdf))(?![\w])", re.I)
 
 
 def attach(ws, task: str, text: str) -> str:
@@ -1083,6 +1091,28 @@ def main() -> None:
         with connect() as ws:
             r = call(ws, {"op": "ask", "task": task, "text": a[0], "options": a[1:]})
         print(f"asked the owner (#{r.get('id')}): his page shows the options as buttons; his pick comes as a message. Go on with what does not depend on it.")
+    elif cmd == "confirm":                       # agentchat confirm "<what will be done>": the owner's yes for a critical action (#3057)
+        if len(a) != 1:
+            raise SystemExit('agentchat confirm "<what exactly will be done>"')
+        with connect() as ws:
+            r = call(ws, {"op": "confirm", "task": task, "text": a[0]})
+        print(f"asked the owner to confirm (#{r.get('id')}), good for {int(r.get('ttl') or 0) // 60} minutes. His pick comes as a message; "
+              f"before you act, ask the server itself: agentchat confirmed {r.get('id')}")
+    elif cmd == "confirmed":                     # agentchat confirmed <id>: what the owner picked, as the server has it; exit 0 only for yes
+        if len(a) != 1 or not a[0].lstrip("#").isdigit():
+            raise SystemExit("agentchat confirmed <id of your question>")
+        with connect() as ws:
+            r = call(ws, {"op": "confirmed", "task": task, "id": int(a[0].lstrip("#"))})
+        st = r.get("state")
+        print({"yes": "yes: the owner confirmed it on his signed-in page (the server checked who it was)", "no": "no: the owner refused",
+               "expired": "expired: no answer in time, ask again", "wait": "wait: no answer yet"}.get(st, str(st)) + f'\n    {r.get("text")}')
+        raise SystemExit(0 if st == "yes" else 4)
+    elif cmd == "card":                          # agentchat card <artifact link> "<title>" ["<first paragraph>"]: the words of its card (#3068)
+        if len(a) not in (1, 2, 3):
+            raise SystemExit('agentchat card <https://claude.ai/artifact/...> "<title>" ["<the first paragraph>"]   (the link alone: the words go)')
+        with connect() as ws:
+            call(ws, {"op": "card", "task": task, "url": a[0], "text": a[1] if len(a) > 1 else "", "desc": a[2] if len(a) > 2 else ""})
+        print("the card says it now" if len(a) > 1 else "the card's words are gone")
     elif cmd == "poll":                          # agentchat poll [--multi] "<question>" "<option>" ...: a poll on the page (the owner, #1386)
         multi, anon = "--multi" in a, "--anon" in a
         a = [x for x in a if x not in ("--multi", "--anon")]

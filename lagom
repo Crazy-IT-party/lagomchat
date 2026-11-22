@@ -5,6 +5,8 @@
 #                      keep running as services (launchd on a Mac, systemd --user on Linux)
 #   ./lagom --no-open  the same without opening the browser
 #   ./lagom --app      for the LagomChat app: starts the manager in the background if it is not up, prints its address
+#   ./lagom status | stop [chat ...] | start [chat ...] | restart [chat ...] | clone <folder> | help
+#                      the same without the page: the whole setup stopped and started again, another one from scratch
 # Everything of this machine stays in .lagomchat/ of this working copy (git ignores it): config.json, the Python venv.
 set -euo pipefail
 cd "$(dirname "$0")"

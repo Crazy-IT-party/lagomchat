@@ -6,6 +6,8 @@
                                           books -> the title "books". Makes the conf and data folders, the Cloudflare Access
                                           apps (the page: the owner only; the agents' sockets: bypass, the server checks the
                                           token), the tunnel's route and the DNS name, the LaunchAgent, and starts it
+    chats.py create ... --import <folder> the new chat opens with the import of that Telegram export (Telegram Desktop, Export chat
+                                          history, JSON: the folder with result.json) ready to start
     chats.py stop <slug> | start <slug>   the LaunchAgent off / on (everything else stays)
     chats.py icon <slug> [--text <1-3 letters>] [--color <#rrggbb>] [--img <png/jpg/webp file> | --noimg] [--bg <#rrggbb | "">]
                                           the chat's round icon on the rail: a monogram in a colour, or a picture
@@ -131,7 +133,8 @@ def cf(method: str, path: str, body=None, ok404: bool = False):
 
 
 def cf_apps(host: str, owner: str) -> dict:
-    base = {"type": "self_hosted", "allowed_idps": [IDP], "auto_redirect_to_identity": True, "app_launcher_visible": True,
+    # no list of sign-in providers = all the account has (Google, GitHub, passkeys, a code by email): the person picks (the owner, 2026-11-16)
+    base = {"type": "self_hosted", "allowed_idps": [], "auto_redirect_to_identity": False, "app_launcher_visible": True,
             "http_only_cookie_attribute": True}
     page = cf("POST", f"/accounts/{ACCOUNT}/access/apps", {
         **base, "name": f"LagomChat {host}", "domain": host, "destinations": [{"type": "public", "uri": host}],
@@ -140,7 +143,7 @@ def cf_apps(host: str, owner: str) -> dict:
     try:
         sock = cf("POST", f"/accounts/{ACCOUNT}/access/apps", {
             **base, "name": f"LagomChat {host}: agents' sockets (token checked by the server)", "domain": f"{host}/ws",
-            "destinations": [{"type": "public", "uri": f"{host}/{p}"} for p in ("ws", "listen", "img", "join")], "session_duration": "24h",
+            "destinations": [{"type": "public", "uri": f"{host}{p}"} for p in lagomcfg.OPEN_PATHS], "session_duration": "24h",
             "policies": [{"name": "Agents' sockets: bypass, the server checks the token", "decision": "bypass",
                           "include": [{"everyone": {}}], "precedence": 1}]})
     except Fail:
@@ -164,6 +167,30 @@ def cf_dns_find(host: str, zone: str = ZONE) -> list:
 
 
 # ---------------------------------------------------------------- the service (launchd on a Mac, systemd --user on Linux)
+def dns_live(host: str, ns: list[str], secs: float = 45) -> bool:
+    """wait until the zone's own name servers answer for the new name. A resolver asked before that keeps "no such name" for half
+    an hour (the zone's negative TTL), and the browser asks the moment the chat shows on the rail: the owner then cannot open the
+    chat he has just made. The name servers are asked directly, so nothing is cached by this"""
+    q = os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"".join(bytes([len(x)]) + x.encode() for x in host.split(".")) + b"\x00\x00\x01\x00\x01"
+    end, good = time.time() + secs, 0
+    while time.time() < end and ns:
+        ok = 0
+        for n in ns:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as k:
+                    k.settimeout(2)
+                    k.sendto(q, (socket.gethostbyname(n), 53))
+                    r = k.recv(512)
+                ok += r[:2] == q[:2] and not r[3] & 15 and int.from_bytes(r[6:8], "big") > 0      # no error, and an answer in it
+            except OSError:
+                pass
+        good = good + 1 if ok == len(ns) else 0
+        if good >= 2:                            # twice in a row from every one of them
+            return True
+        time.sleep(1)
+    return False
+
+
 def launch(slug: str, on: bool) -> None:
     ch = load().get(slug) or {}
     lagomcfg.service(slug, ch, "start" if on else "stop")
@@ -179,8 +206,12 @@ def wait_port(port: int, up: bool, secs: float = 20) -> bool:
 
 
 # ---------------------------------------------------------------- the commands
-def create(title: str, slug: str) -> dict:
+def create(title: str, slug: str, imp: str = "") -> dict:
     title, slug = names(title, slug)
+    if imp:                                      # a Telegram export for the new chat: checked before anything is made
+        imp = str(Path(imp).expanduser().resolve())
+        if not (Path(imp) / "result.json").is_file():
+            raise Fail(f"no Telegram export in {imp}: the folder with result.json, please")
     reg = load()
     host = f"{slug}.{NEW_DOMAIN}"
     zone = ZONES.get(NEW_DOMAIN) or next((z["id"] for z in cf("GET", f"/zones?name={NEW_DOMAIN}") or []), None)
@@ -210,6 +241,8 @@ def create(title: str, slug: str) -> dict:
     try:
         data.mkdir(parents=True, exist_ok=True)
         (data / "title.txt").write_text(title)
+        if imp:                                  # the chat's page opens the import with this folder (server.py, api_import)
+            (data / "import_pending.json").write_text(json.dumps({"path": imp}))
         c.update(cf_apps(host, owner))
         save(reg)
         cf_route(host, port)
@@ -217,6 +250,10 @@ def create(title: str, slug: str) -> dict:
                                                            "proxied": True, "ttl": 1, "comment": f"agentchat {slug} on the Mac :{port}"})["id"]
         save(reg)                                # the conf folder and the service are written out of the config
         launch(slug, True)
+        try:                                     # the name is asked for only when it is there: see dns_live
+            dns_live(host, (cf("GET", f"/zones/{zone}") or {}).get("name_servers") or [])
+        except Exception:
+            pass
         if not wait_port(port, True):
             raise Fail(f"the server did not start: see {lagomcfg.log_file(slug, c)}")
     except Exception as e:
@@ -244,6 +281,8 @@ def delete(slug: str) -> dict:
         raise Fail(f"no chat {slug!r}")
     if c.get("main"):
         raise Fail("the main chat is not deleted from here")
+    if lagomcfg.via(c) != "cloudflare":                  # this machine only, ngrok, an own domain: nothing of Cloudflare's to take away
+        return lagomcfg.delete_local(lagomcfg.load(), slug)
     launch(slug, False)
     lagomcfg.service_file(slug, c).unlink(missing_ok=True)
     errs = []
@@ -335,11 +374,14 @@ def main() -> None:
         if cmd == "list":
             r = listing(load())
         elif cmd == "create":
+            imp = a[a.index("--import") + 1] if "--import" in a and a.index("--import") + 1 < len(a) else ""
+            if "--import" in a:
+                del a[a.index("--import"):a.index("--import") + 2]
             title = a[0] if a else ""
             slug = a[1] if len(a) > 1 else ""
             if len(a) == 1 and SLUG_RE.match(a[0]) and " " not in a[0]:
                 title, slug = "", a[0]            # one plain word: the subdomain (the title is made from it)
-            r = create(title, slug)
+            r = create(title, slug, imp)
         elif cmd in ("stop", "start") and a:
             r = stop(a[0], cmd == "start")
         elif cmd == "icon" and a:
