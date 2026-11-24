@@ -71,6 +71,7 @@ from imgdesc import Down as VisionDown, ImgDesc, KINDS as PIC_KINDS  # noqa: E40
 import talks as talks_mod  # noqa: E402
 
 PORT = int(os.environ.get("LAGOMCHAT_PORT", "8150"))
+PIN_KINDS = ("msg", "hello", "bye", "gone", "rename", "remind", "pjoin", "pleft")   # what may be pinned: the lines of the log too (the owner, #3507)
 PEOPLE_KINDS = ("pjoin", "pleft", "kstati", "remind")      # a person came / went, a reminder (kstati: the facts of old logs, not shown): lines of the log for the page only
 PEOPLE_LEAVE_DELAY = float(os.environ.get("LAGOMCHAT_LEAVE_DELAY", "1800"))   # gone for 30 min before "left the chat": a look in and out writes nothing (the owner, #2090)
 PEOPLE_QUIET = float(os.environ.get("LAGOMCHAT_PEOPLE_QUIET", "30"))
@@ -154,6 +155,11 @@ class Chat:
             self.cal: list[dict] = json.loads(self.cal_file.read_text())
         except (OSError, ValueError):
             self.cal = []
+        self.surveys_file = DATA / "surveys.json"              # the questionnaires (the owner, #3498): a question of his, an answer of every person
+        try:
+            self.surveys: list[dict] = json.loads(self.surveys_file.read_text())
+        except (OSError, ValueError):
+            self.surveys = []
         try:
             self.handoffs: dict[str, dict] = json.loads(self.handoffs_file.read_text())
         except (OSError, ValueError):
@@ -499,13 +505,14 @@ class Chat:
         for p in self.pins:
             e = byid.get(p["id"])
             if e and e["id"] >= start and e["id"] not in self.deleted:
-                out.append({**p, "agent": e["agent"], "ts_msg": e["ts"], "text": " ".join((e["text"] or "").split())[:1500]})   # (the page draws one line: long enough for the links of its videos, #2041)
+                out.append({**p, "agent": e["agent"], "ts_msg": e["ts"], "text": " ".join((e["text"] or "").split())[:1500],
+                            **({k: e[k] for k in ("kind", "sv", "cal") if e.get(k)} if e["kind"] != "msg" else {})})   # (the page draws one line: long enough for the links of its videos, #2041)
         return out
 
     async def set_pin(self, mid: int, on: bool, by: str) -> str:
         """pin / unpin a message; '' or why not"""
         e = next((x for x in self.events if x["id"] == mid), None)
-        if on and (not e or e["kind"] != "msg" or mid in self.deleted):
+        if on and (not e or e["kind"] not in PIN_KINDS or mid in self.deleted):
             return f"no message #{mid}"
         had = any(p["id"] == mid for p in self.pins)
         if on == had:
@@ -1745,6 +1752,14 @@ async def op(q: dict, ws) -> dict:
             return {"ok": False, "error": "the chat's name is superman's (the owner's deputy) to change"}
         await chat.set_title(t, tr, a["name"])
         return {"ok": True, "title": chat.title, "tr": chat.title_tr}
+    if kind == "surveys":
+        # the questionnaires with every answer (the owner, #3498): superman's only - he answers what he is asked with them in mind
+        if a["name"].lower() not in DEPUTY:
+            return {"ok": False, "error": "the questionnaires are superman's (the owner's deputy) to read"}
+        ppl = {"owner": USER["name"], **access_people()}
+        return {"ok": True, "surveys": [{"id": s["id"], "q": s["q"], "made": s["made"], "open": bool(s.get("open", True)), "who": _sv_who(s),
+                                         "ans": {n: {"text": x["text"], "at": x["at"]} for n, x in s["ans"].items()}}
+                                        for s in sorted(chat.surveys, key=lambda s: s["made"])], "people": ppl}
     if kind == "history":
         # the whole log from a time or a message on (the owner, 2026-11-02): superman's only - the deputy keeps the chat's memory
         if a["name"].lower() not in DEPUTY:
@@ -2554,7 +2569,7 @@ async def api_display_name(req: web.Request) -> web.Response:
     # only the page of this very host: its Origin, or (a browser that sends none) Sec-Fetch-Site same-origin; the host as the
     # browser used it - through a proxy X-Forwarded-Host (the owner, #1252: Save did nothing behind a proxy)
     org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    same = urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"
+    same = _same_page(req)
     print(f"[name] {v.get('task')}@{client_ip(req)}: origin={org} host={host} -> {'ok' if same else 'refused'}", flush=True)
     if not same:
         return web.json_response({"ok": False, "error": f"refused: the page's origin {org or '-'} is not {host}"}, status=403)
@@ -3528,9 +3543,7 @@ async def api_agent_color(req: web.Request) -> web.Response:
     v = await need_viewer(req)
     if v.get("role") != "owner":
         return web.json_response({"ok": False, "error": "only the owner"}, status=403)
-    org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    same = urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"
-    if not same:
+    if not _same_page(req):
         return web.json_response({"ok": False, "error": "refused: another site"}, status=403)
     try:
         q = await req.json()
@@ -4174,7 +4187,7 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
 
 UPLOADS = Path.home() / "agentchat-uploads"        # the pictures the owner pastes into the page's message box
 UP_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
-            # videos (the owner, 2026-11-03, #1426): up to 50 MB; avi / mkv / mov are made mp4 (H.264 + AAC) so every browser plays them
+            # videos (the owner, 2026-11-03, #1426): up to 200 MB (#3454); avi / mkv / mov are made mp4 (H.264 + AAC) so every browser plays them
             "video/mp4": ".mp4", "video/quicktime": ".mov", "video/x-msvideo": ".avi", "video/avi": ".avi", "video/x-matroska": ".mkv",
             # a voice message of the push-to-talk button (the owner, #2773): the page sends wav, kept as m4a every browser plays
             "audio/wav": ".wav", "audio/x-wav": ".wav",
@@ -4185,7 +4198,7 @@ UP_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "ima
 UP_PDF_MAX = 50 * 2 ** 20
 UP_VOICE_MAX = 12 * 2 ** 20                         # 16 kHz mono: six minutes
 UP_EXT = {".mp4": ".mp4", ".m4v": ".mp4", ".mov": ".mov", ".avi": ".avi", ".mkv": ".mkv", ".heic": ".heic", ".heif": ".heic", ".pdf": ".pdf"}   # a browser that sends no type: by the name
-UP_VIDEO_MAX = 50 * 2 ** 20
+UP_VIDEO_MAX = 200 * 2 ** 20
 # the service's PATH has no anaconda: ffmpeg next to the python that runs the server, else the system's
 FFMPEG = str(Path(sys.executable).with_name("ffmpeg")) if Path(sys.executable).with_name("ffmpeg").exists() else (__import__("shutil").which("ffmpeg") or "ffmpeg")
 UP_MAGIC = {".png": b"\x89PNG", ".jpg": b"\xff\xd8", ".gif": b"GIF8", ".webp": b"RIFF"}
@@ -4353,10 +4366,15 @@ def settings() -> dict:
 
 # "Apply to all chats" in the page's settings (the owner, 2026-11-08, #1858): a person's look and feel kept once for every chat on
 # this machine - the chats are separate sites (each its own localStorage), so the page keeps them here, by the person's email.
-# {email: {"all": bool, "prefs": {key: value}}}; only the keys the page lists, short strings
+# {email: {"all": bool, "off": [a chat's address], "prefs": {key: value}}}; only the keys the page lists, short strings.
+# Every setting of the page and the profile, for the chats picked (the owner, #3523): "off" names the chats left out (one not
+# named takes part, a new one too); a value is kept even when empty, so a key that is not there was never shared
 SHARED_PREFS = Path(os.environ.get("LAGOMCHAT_SHARED_PREFS", Path.home() / ".config/agentchat-chats/prefs.json"))
 PREF_KEYS = {"ac_theme", "ac_lang", "ac_tsz", "ac_tbs", "ac_sbs", "ac_side", "ac_enter", "ac_hidevotes", "ac_hidesys", "ac_hidetr",
-             "ac_joinsnd", "ac_awayafter", "ac_hideviews"}
+             "ac_joinsnd", "ac_awayafter", "ac_hideviews", "ac_cord", "ac_caps", "ac_mirror", "ac_micgain", "ac_agsort", "ac_agrev",
+             "ac_ppsort", "ac_pprev", "ac_camfold", "ac_fold_roster", "ac_fold_sv", "ac_fold_cal", "ac_aside_w", "ac_aside_off",
+             "sv_showlang", "sv_showtz", "sv_nocc",                    # what a chat keeps by the person: its page sets it there
+             "pf_name", "pf_color", "pf_mono", "pf_yt", "pf_status", "pf_snd_in", "pf_snd_out", "pf_photo"}
 
 
 def _shared_prefs_load() -> dict:
@@ -4367,6 +4385,88 @@ def _shared_prefs_load() -> dict:
         return {}
 
 
+async def prefs_loop() -> None:
+    """the shared settings changed in another chat of this machine: this chat's pages of that person are told and take them at
+    once. Before, a page asked only when it came into view, so a chat window that stays on the screen never learnt of a
+    picture or a monogram set in another one (the owner, #3543)"""
+    def stamp() -> int:
+        try:
+            return SHARED_PREFS.stat().st_mtime_ns
+        except OSError:
+            return 0                                  # no file yet: its first writing is a change too
+    seen, was = stamp(), _shared_prefs_load()
+    while True:
+        await asyncio.sleep(1.5)
+        m = stamp()
+        if m == seen:
+            continue
+        seen, cur = m, _shared_prefs_load()
+        changed = {em for em in set(cur) | set(was) if cur.get(em) != was.get(em)}
+        was = cur
+        for ws, v in list(chat.viewers.items()):
+            if str(v.get("em") or "").lower() in changed:
+                await send(ws, '{"type": "prefs"}')
+
+
+def _my_chats(em: str) -> list[dict]:
+    """the chats of this machine a person is let into, by the email they signed in with: they own it, or are on its list by
+    address or by domain. Asked of the install's config, never of what the person's page says: the titles of the others and
+    the files in them are not theirs to see"""
+    try:
+        import lagomcfg
+        c = lagomcfg.load()
+    except Exception:
+        return []
+    def mine(ch: dict) -> bool:
+        g, low = ch.get("guests") or {}, lambda v: [str(x).strip().lower() for x in v or []]
+        return em == str(ch.get("owner_email") or c.get("owner_email") or "").strip().lower() or em in low(g.get("google_emails")) \
+            or em.rsplit("@", 1)[-1] in low(g.get("google_domains"))
+    return [ch for ch in c.get("chats", {}).values() if isinstance(ch, dict) and em and mine(ch)]
+
+
+def _prefs_chats(req: web.Request, em: str) -> tuple[str, list | None, dict]:
+    """this chat's address as the shared settings name it, the chats of this machine the person may pick among (None: no
+    install around, the page shows the list it has), and their titles by address"""
+    host = req.headers.get("X-Forwarded-Host") or req.headers.get("Host", "")
+    here, urls, titles = _chat_url(host if host.startswith(("127.", "localhost")) else host.split(":")[0]), None, {}
+    try:
+        import lagomcfg
+        chats = lagomcfg.load().get("chats", {})
+        if chats:
+            here = next((lagomcfg.chat_url(ch) for ch in chats.values() if str(ch.get("port")) == str(PORT)), here)
+            urls = []
+            for ch in _my_chats(em):
+                u = lagomcfg.chat_url(ch)
+                urls.append(u)
+                try:
+                    titles[u] = (Path(str(ch.get("data") or "/nonexistent")) / "title.txt").read_text().strip()
+                except OSError:
+                    titles[u] = ""
+                titles[u] = titles[u] or str(ch.get("title") or "")
+            if here not in urls:
+                urls.insert(0, here)
+    except Exception:
+        pass
+    return here, urls, {u: t for u, t in titles.items() if t}
+
+
+def _take_file(em: str, to: Path, name: str) -> bool:
+    """a person's own sound or picture goes with their settings: the file of this name is here, or is copied here from the
+    same folder of another chat of this machine the person is let into"""
+    if (to / name).is_file():
+        return True
+    for ch in _my_chats(em):
+        p = Path(str(ch.get("data") or "/nonexistent")) / to.name / name
+        try:
+            if p.is_file():
+                to.mkdir(parents=True, exist_ok=True)
+                (to / name).write_bytes(p.read_bytes())
+                return True
+        except OSError:
+            pass
+    return False
+
+
 async def api_prefs(req: web.Request) -> web.Response:
     v = await viewer_of(req)
     em = str(v.get("em") or "").lower()
@@ -4374,35 +4474,40 @@ async def api_prefs(req: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "sign in first"}, status=401, headers={"Cache-Control": "no-store"})
     if req.method == "GET":
         cur = _shared_prefs_load().get(em) or {}
-        return web.json_response({"ok": True, "all": bool(cur.get("all")), "prefs": cur.get("prefs") or {}}, headers={"Cache-Control": "no-store"})
-    org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    same = urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"
-    if not same:
+        here, urls, titles = _prefs_chats(req, em)
+        return web.json_response({"ok": True, "all": bool(cur.get("all")), "off": cur.get("off") or [], "here": here, "urls": urls, "titles": titles,
+                                  "prefs": cur.get("prefs") or {}}, headers={"Cache-Control": "no-store"})
+    if not _same_page(req):
         return web.json_response({"ok": False, "error": "refused: another site"}, status=403)
     try:
         q = await req.json()
     except ValueError:
         q = {}
-    d = _shared_prefs_load()
-    cur = d.get(em) if isinstance(d.get(em), dict) else {}
-    if "all" in q:
-        cur["all"] = bool(q["all"])
-    if isinstance(q.get("prefs"), dict):
-        p = dict(cur.get("prefs") or {})
-        for k, val in q["prefs"].items():
-            if k not in PREF_KEYS:
-                continue
-            if val is None or val == "":
-                p.pop(k, None)
-            else:
-                p[k] = str(val)[:40]
-        cur["prefs"] = p
-    d[em] = cur
+    if not isinstance(q, dict):
+        q = {}
+    here, urls, titles = _prefs_chats(req, em)
+    # every chat of the machine writes this one file: read, change and replace under a lock, with no await between (as the rail's)
     SHARED_PREFS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SHARED_PREFS.with_name(f"{SHARED_PREFS.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1))
-    tmp.replace(SHARED_PREFS)
-    return web.json_response({"ok": True, "all": bool(cur.get("all")), "prefs": cur.get("prefs") or {}})
+    with open(SHARED_PREFS.with_name(SHARED_PREFS.name + ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        d = _shared_prefs_load()
+        cur = d.get(em) if isinstance(d.get(em), dict) else {}
+        if "all" in q:
+            cur["all"] = bool(q["all"])
+        if isinstance(q.get("off"), list):
+            cur["off"] = sorted({u for u in q["off"][:200] if isinstance(u, str) and re.fullmatch(r"https?://[^\s/]{1,200}", u)})
+        if isinstance(q.get("prefs"), dict) and here not in (cur.get("off") or []):   # a chat left out keeps its own and gives nothing
+            p = dict(cur.get("prefs") or {})
+            for k, val in q["prefs"].items():
+                if k in PREF_KEYS:
+                    p[k] = "" if val is None else str(val)[:300]
+            cur["prefs"] = p
+        d[em] = cur
+        tmp = SHARED_PREFS.with_name(f"{SHARED_PREFS.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1))
+        tmp.replace(SHARED_PREFS)
+    return web.json_response({"ok": True, "all": bool(cur.get("all")), "off": cur.get("off") or [], "here": here, "urls": urls, "titles": titles,
+                              "prefs": cur.get("prefs") or {}})
 
 
 # the left rail's list of chats, its order and folders (the owner, #2777): one copy for every chat on this machine, kept here by the
@@ -4492,8 +4597,7 @@ def _rail_put(q: dict, cur: dict) -> None:
 
 async def api_status(req: web.Request) -> web.Response:
     v = await need_viewer(req)
-    org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    if not (urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"):
+    if not _same_page(req):
         raise web.HTTPForbidden()
     try:
         q = await req.json()
@@ -4539,8 +4643,7 @@ async def api_photo(req: web.Request) -> web.Response:
     """a person's own picture (the owner, #90). POST the JPEG the page's editor cut as the body; ?on=1|0 shows or hides the one kept;
     ?remove=1 deletes it. {ok, avatar: what the page shows now, photo: {h, on} or null}"""
     v = await need_viewer(req)
-    org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    if not (urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"):
+    if not _same_page(req):
         raise web.HTTPForbidden()
     task = v.get("task") or ""
     if not task:
@@ -4549,6 +4652,13 @@ async def api_photo(req: web.Request) -> web.Response:
     old = cur.get("h")
     if req.query.get("remove"):
         cur = {}
+    elif req.query.get("copy"):
+        # the picture the person has in another chat of this machine, by its name there (the owner, #3523: the profile goes with
+        # the settings to the chats picked); shown at once
+        h = req.query["copy"]
+        if not re.fullmatch(r"[0-9a-f]{16}", h) or not _take_file(str(v.get("em") or "").lower(), chat.photos_dir, f"{h}.jpg"):
+            return web.json_response({"ok": False, "error": "no_photo"}, status=400)
+        cur = {"h": h, "on": True}
     elif req.query.get("on") in ("0", "1"):
         if not cur:
             return web.json_response({"ok": False, "error": "no_photo"}, status=400)
@@ -4591,8 +4701,7 @@ async def api_sound(req: web.Request) -> web.Response:
     """a person's own join / leave sound (the owner, #1798). POST ?kind=in|out with the file as the body (mp3, wav, aac, m4a), or
     &remove=1. Never kept as it came: re-encoded to mp3, 1 s at most, the level brought to SOUND_MEAN_DB, peaks under SOUND_PEAK_DB"""
     v = await need_viewer(req)
-    org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    if not (urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"):
+    if not _same_page(req):
         raise web.HTTPForbidden()
     kind, task = req.query.get("kind"), v.get("task") or ""
     if kind not in ("in", "out") or not task:
@@ -4613,6 +4722,16 @@ async def api_sound(req: web.Request) -> web.Response:
         store(None)
         await chat.send_presence()
         return web.json_response({"ok": True})
+    if req.query.get("copy"):
+        # the sound the person has in another chat of this machine, by its name there (the owner, #3523: the profile goes with
+        # the settings to the chats picked)
+        h = req.query["copy"]
+        if not re.fullmatch(r"[0-9a-f]{16}", h) or not _take_file(str(v.get("em") or "").lower(), chat.sounds_dir, f"{h}.mp3"):
+            return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        store(h)
+        print(f"[sound] {v.get('name')} {kind} {h}: from the shared settings", flush=True)
+        await chat.send_presence()
+        return web.json_response({"ok": True, "hash": h})
     if req.query.get("preset"):
         h = SOUND_PRESETS.get(req.query["preset"], {}).get(kind)
         if not h:
@@ -4672,6 +4791,8 @@ STICKER_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif",
 
 
 def _same_page(req: web.Request) -> bool:
+    """only the page of this very host: its Origin, or (a browser that sends none) Sec-Fetch-Site same-origin; the host as the
+    browser used it - through a proxy X-Forwarded-Host"""
     org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
     return urlparse(org).netloc in (host, req.headers.get("Host")) if org else req.headers.get("Sec-Fetch-Site") == "same-origin"
 
@@ -5562,6 +5683,77 @@ async def api_calendar(req: web.Request) -> web.Response:
     print(f"[cal] {v.get('name')}: {op_} {(ev or chat.cal[-1])['title'][:60]!r}", flush=True)
     await chat.watch_all({"type": "cal"})
     return web.json_response({"ok": True, "events": _cal_out(v)})
+
+
+SV_MAX, SV_Q, SV_A = 50, 500, 8000      # questionnaires at most; the letters of a question and of an answer
+
+
+def _sv_who(s: dict, more: str = "") -> list[str]:
+    """whose tabs a questionnaire has: the owner, everyone let into the chat by email, whoever has answered, and the one who looks"""
+    return list(dict.fromkeys(["owner", *access_people(), *s["ans"], *([more] if more else [])]))
+
+
+def _sv_out(v: dict) -> list[dict]:
+    """the questionnaires as this viewer sees them, the newest first. The answers of the others: all of them for the owner and in a
+    questionnaire made open; in a closed one only who has answered"""
+    me, own = _cal_me(v), v["role"] == "owner"
+    return [{"id": s["id"], "q": s["q"], "made": s["made"], "open": bool(s.get("open", True)), "mine": own,
+             "who": (who := _sv_who(s, me if v.get("task") else "")), "gave": [n for n in who if n in s["ans"]],
+             "ans": {n: {"text": a["text"], "at": a["at"]} for n, a in s["ans"].items() if own or s.get("open", True) or n == me}}
+            for s in sorted(chat.surveys, key=lambda s: -s["made"])]
+
+
+def _sv_save() -> None:
+    tmp = chat.surveys_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(chat.surveys, ensure_ascii=False))
+    tmp.replace(chat.surveys_file)
+
+
+async def api_surveys(req: web.Request) -> web.Response:
+    """the questionnaires (the owner, #3498). GET: as this viewer sees them. POST {op: add, q, open}: a new one, the owner's alone to
+    make; {op: del, id}: his too; {op: answer, id, text}: the answer of the one who sends it, saved over the one before - an empty
+    text takes it back"""
+    v = await need_viewer(req)
+    if req.method == "GET":
+        return web.json_response({"ok": True, "surveys": _sv_out(v)}, headers={"Cache-Control": "no-store"})
+    if not _same_page(req) or not v.get("task"):
+        raise web.HTTPForbidden()
+    try:
+        q = await req.json()
+        assert isinstance(q, dict)
+    except Exception:
+        return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+    me, now, op_, told = _cal_me(v), time.time(), q.get("op"), False
+    sv = next((s for s in chat.surveys if s["id"] == q.get("id")), None)
+    text = re.sub(r"\n{3,}", "\n\n", str(q.get("q" if op_ == "add" else "text") or "").replace("\r\n", "\n").replace("\r", "\n")).strip()
+    if op_ in ("add", "del") and v["role"] != "owner":
+        return web.json_response({"ok": False, "error": "only the owner"}, status=403)
+    if op_ == "add":
+        if not text or len(text) > SV_Q:
+            return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        if len(chat.surveys) >= SV_MAX:
+            return web.json_response({"ok": False, "error": "too_many"})
+        sv = {"id": secrets.token_hex(6), "q": text, "by_task": v["task"], "by_name": me, "made": round(now), "open": q.get("open") is not False, "ans": {}}
+        chat.surveys.append(sv)
+        told = True
+    elif op_ == "del" and sv:
+        chat.surveys.remove(sv)
+    elif op_ == "answer" and sv:
+        if len(text) > SV_A:
+            return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        if text:
+            sv["ans"][me] = {"text": text, "at": round(now), "task": v["task"]}
+        else:
+            sv["ans"].pop(me, None)
+    else:
+        return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+    _sv_save()
+    print(f"[survey] {v.get('name')}: {op_} {sv['q'][:60]!r}", flush=True)
+    await chat.watch_all({"type": "survey"})
+    if told:                                                 # a line in the chat for the people it asks (the owner, #3500): on a phone the widget is a page away
+        await chat.post("remind", {"name": me, "task": v["task"]}, f'New questionnaire: {sv["q"]}',
+                        to=[n for n in _sv_who(sv) if n != "owner"] or None, sv={"id": sv["id"], "q": sv["q"]})
+    return web.json_response({"ok": True, "surveys": _sv_out(v)})
 
 
 async def cal_loop() -> None:
@@ -6497,6 +6689,7 @@ async def on_start(app):
     app["remind"] = asyncio.create_task(remind_loop())
     app["cal"] = asyncio.create_task(cal_loop())
     app["owner"] = asyncio.create_task(owner_loop())
+    app["prefs"] = asyncio.create_task(prefs_loop())
 
 
 async def on_stop(app):
@@ -6541,7 +6734,7 @@ def main():
     global chat
     sys.stdout, sys.stderr = _Stamped(sys.stdout), _Stamped(sys.stderr)
     chat = Chat()
-    app = web.Application(client_max_size=55 * 2 ** 20)          # a video up to 50 MB (#1426)
+    app = web.Application(client_max_size=205 * 2 ** 20)         # a video up to 200 MB (#1426, #3454)
     if UPLOADS.is_dir():                              # two weeks, then gone
         for f in (*UPLOADS.iterdir(), *(PDF_PV.iterdir() if PDF_PV.is_dir() else ())):
             if f.is_file() and time.time() - f.stat().st_mtime > UP_KEEP:
@@ -6580,6 +6773,7 @@ def main():
     app.router.add_get("/api/shot/{name}", api_shot)
     app.router.add_get("/api/release", api_release)
     app.router.add_route("*", "/api/calendar", api_calendar)
+    app.router.add_route("*", "/api/surveys", api_surveys)
     app.router.add_route("*", "/api/import", api_import)
     app.router.add_get("/api/clocks", api_clocks)
     app.router.add_post("/api/stt_token", api_stt_token)

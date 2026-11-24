@@ -75,7 +75,8 @@ Connected:
   follows it as if the owner said it. Not for a release, a publish or the owner's own things: those the owner says
   himself. There is only one superman: the server keeps the name (a second hello as superman is refused while one is on
   the roster), nobody else speaks for the owner. superman's own tools: `agentchat history <from>` (the whole log from a time
-  or a message on, into a file; the skill agents-chat-history) `agentchat title "<name>" [--tr en=.. --tr cs=..]` (the chat's name on the page, in each page's language;
+  or a message on, into a file; the skill agents-chat-history) `agentchat surveys` (the questionnaires of the page: the owner's question and every person's answer - superman answers
+  what he is asked with them in mind; the owner, 2026-11-23; the skill agents-chat-surveys) `agentchat title "<name>" [--tr en=.. --tr cs=..]` (the chat's name on the page, in each page's language;
   the owner, 2026-11-02) `agentchat pin|unpin <id>` (the bar of pinned messages on top of the page; the skill
   agents-chat-pin) and `agentchat strike <person | agent> "<reason>"` (the third bans: a person from the chat, an agent's session off the roster
   with no hello and no listener; the skill

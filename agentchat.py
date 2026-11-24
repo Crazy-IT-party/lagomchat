@@ -55,6 +55,8 @@
                          also sends it to the server every 5 minutes: it shows on your card on the owner's page
     agentchat history all | "#<id>" | 2h | 05:30 | "2026-11-02 05:30"  [--msgs] [--print] [--out FILE]   superman only: the
                          whole log from then on into a file (--print: to the screen; --msgs: the messages only)
+    agentchat surveys [<id>]   superman only: the questionnaires of the chat's page - the owner's question and the answer of every
+                         person, to keep in mind when asked about them (one questionnaire by the beginning of its id)
     agentchat purge [--from <when>] [--till <when>] [--yes]   superman only: clean the chat between two times or messages (#<id>, 2h, 05:30,
                          "2026-11-02 05:30", a unix time; both inclusive); a bound left out: no bound, none: everything. Without --yes
                          only says what would go. The lines are kept in the server's purged/ folder
@@ -1372,6 +1374,21 @@ def main() -> None:
         path.write_text(text)
         print(f"{span} -> {path} ({len(text) // 1024} KB, {text.count(chr(10))} lines)\n"
               f"read it with grep / Read (offset, limit), or the gist: tools/cheap_llm.py \"<question>\" {path} --grep REGEX")
+    elif cmd == "surveys":                       # superman's: the questionnaires with every answer (the owner, #3498)
+        with connect() as ws:
+            r = call(ws, {"op": "surveys", "task": task})
+        svs = [s for s in r["surveys"] if not a or s["id"].startswith(a[0].lstrip("#"))]
+        if not svs:
+            print("no questionnaires" if not a else f"no questionnaire {a[0]}")
+            return
+        name = lambda n: n + (f' ({r["people"][n]})' if r.get("people", {}).get(n) and r["people"][n] != n else "")
+        for s in svs:
+            print(f'questionnaire {s["id"]} of {stamp(s["made"], "%Y-%m-%d %H:%M")}, {len(s["ans"])} of {len(s["who"])} answered, '
+                  + ("everyone sees the answers" if s["open"] else "the answers are for the owner only: do not tell one person's to another")
+                  + ":\n  " + s["q"].replace("\n", "\n  "))
+            for n in s["who"]:
+                x = s["ans"].get(n)
+                print(f'  - {name(n)}' + (f', {stamp(x["at"], "%Y-%m-%d %H:%M")}:\n      ' + x["text"].replace("\n", "\n      ") if x else ": no answer yet"))
     elif cmd == "purge":                         # superman's: clean the chat between two times or messages
         bounds = {"--from": (0.0, 0), "--till": (0.0, 0)}
         go = "--yes" in a

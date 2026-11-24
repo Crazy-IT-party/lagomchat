@@ -269,15 +269,22 @@ made, and fetches only pictures named in messages.
 ## The app (Mac, Linux)
 
     cd desktop && npm install && npm run build                  # Mac
-    cd desktop && npm install && npx tauri build --bundles appimage,deb   # Linux
+    cd desktop/linux && npm install && npm run build            # Linux
 
-Needs Node and Rust (rustup; `desktop/src-tauri/rust-toolchain.toml` pins the version). `npm run build` is
-`tauri build --bundles app`. Result: `desktop/src-tauri/target/release/bundle/macos/LagomChat.app`; on Linux
-`bundle/appimage/LagomChat_*.AppImage` and `bundle/deb/*.deb` (needs the WebKitGTK 4.1 dev packages: on Debian / Ubuntu
-`libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`). Build it from the
-working copy you run: its menu's Chats and Server runs that copy's `./lagom --app`. The app shows the page in its window,
-the page's Settings in a window of their own (Cmd+,), the page's notifications as the system's own, and on a Mac the
-unread count of the page's title "(N) ..." as the Dock badge; nothing but the title comes from the page (the notices ride in it too).
+The Mac's app shows the page in the system's WebKit (Tauri): needs Node and Rust (rustup; `desktop/src-tauri/rust-toolchain.toml`
+pins the version), `npm run build` is `tauri build --bundles app`, the result is
+`desktop/src-tauri/target/release/bundle/macos/LagomChat.app`.
+
+The Linux app shows it in Chromium (Electron, `desktop/linux`): the WebKitGTK of a Linux has no WebRTC, so cameras, voices
+and shared screens did nothing in it. Needs Node only; the result is `desktop/linux/out/LagomChat_*_amd64.AppImage` and
+`LagomChat_*_amd64.deb`. Sharing a screen asks what to show: the system's own window on Wayland, the app's on X11. The
+computer's sound cannot be shared from it (Chromium gives it on Windows only): use a browser for that. The version, the start
+page and the credits are the Mac app's (`stamp.js` takes them before a build).
+
+Build it from the working copy you run: its menu's Chats and Server runs that copy's `./lagom --app` (`npm run release` in
+either folder makes an app for other machines, with no working copy and no path of the building machine in it). The app shows the page in its window, the page's
+Settings in a window of their own (Cmd+, / Ctrl+,), the page's notifications as the system's own, and the unread count of the
+page's title "(N) ..." as the Dock's or the launcher's badge; nothing but the title comes from the page (the notices ride in it too).
 
 ## License
 

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,8 +20,8 @@ const START: &str = "http://tauri.localhost/index.html";
 static MANAGER: Mutex<Option<String>> = Mutex::new(None);
 
 fn repo() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    p.join("lagom").is_file().then_some(p)
+    let p = env!("LAGOM_REPO");                            // set by build.rs; empty: an app for other machines
+    (!p.is_empty() && Path::new(p).join("lagom").is_file()).then(|| PathBuf::from(p))
 }
 
 fn manager() -> Option<(String, u32, Option<String>)> {
