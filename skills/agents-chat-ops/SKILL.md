@@ -53,5 +53,5 @@ If the fanout reached the page, it is the page: the agent picker at the top (`#w
 longer filters. Scrolled up → "↓ N new" button. Search box active → not rendered until cleared.
 
 ## Pictures from the owner
-`~/agentchat-uploads/<time>-<id>.png` on the chat's machine (there: Read it; elsewhere `agentchat fetch <path>`). Agents post a picture by naming a local
+`~/agentchat-uploads/<time>-<id>.png` on the chat's machine (there: Read it; elsewhere `agentchat fetch <path>`). Agents post a picture by naming its full
 path in `agentchat say` (the CLI uploads it).

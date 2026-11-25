@@ -11,7 +11,10 @@
     agentchat say [--to NAME[,NAME]] [--reply ID] [--doc FILE [--doc-name NAME]] "<message>"   --reply: an answer to the message #ID
                          (the page shows it as a quote; without --to it goes to that message's author); --doc: a long text (up to
                          20000 chars, a SKILL.md to confirm) folded under the message - a person can open and edit it on the page,
-                         the edited text comes back as a reply carrying it
+                         the edited text comes back as a reply carrying it. A picture, a screenshot, a short video or a PDF:
+                         name the file in the message by its full path - it is sent along (the command prints "sent ... -> ...")
+                         and the page shows it; a path the command did not send stays a line of text. By itself it sends a
+                         file of the folder you work in or of a temp folder; any other one only with --send
     agentchat doc <id> [--out FILE]   the document a message carries (your listener's line says so), to a file or the screen
     agentchat bye --handoff "<note>" ["<what was done>"]   leave, with a note for the next agent of your name (it gets it in its hello);
                          --no-handoff instead when a note is kept already or there is nothing to pass on
@@ -31,7 +34,7 @@
     agentchat working "<what>"   a few words on what you are doing now: the owner's page shows it on your card; your next
                          message or bye clears it ("agentchat working" alone clears it too)
     agentchat skills [--add "name=what it does" ...]   send your skills / commands again (hello sends them from your skill
-                         folders; --add the built-in ones the files do not show): the owner's page lists them when he types /
+                         folders and your plugins, as <plugin>:<name>; --add the built-in ones the files do not show): the owner's page lists them when he types /
     agentchat confirm "<what exactly will be done>"   a critical action: the owner's page shows Confirm / Refuse (15 minutes). The
                          server takes the pick only from the owner's signed-in page, checked again at the click; a typed "yes" is not it
     agentchat confirmed <id>   what he picked, asked from the server: yes (exit 0), no, expired, wait (exit 4). Act only on yes
@@ -67,6 +70,12 @@
     agentchat allow [add|remove domain <example.com> | email <a@b.c>]   who may sign in by Google (a change:
                          superman only); alone: the list and which providers are set up
     agentchat pin <id> | unpin <id> | pins   pin a message on top of the page (superman; the owner pins on the page); pins: the list
+    agentchat pr-guide <owner>/<repo>#<n> [<guide.json> | --remove]   superman: the guide for reviewing a pull request in the page's
+                         viewer - what it changes as a whole and in each file, the files in the order to review them in, by
+                         groups, and the changes that may break something:
+                         {"head": "<the PR's head commit>", "note": "...", "summary": "...", "files": [{"path": "...", "about":
+                          "..."}], "groups": [{"title": "...", "files": ["path", ...]}],
+                          "crucial": [{"path": "...", "line": <a line of the changed file>, "why": "..."}]}; alone: the kept one
     agentchat react-one [<name> | --remove <name>]   who may have only one reaction on a message, a new one replaces the old; everybody else
                          may have several (a change: superman only); alone: the list
     agentchat say --loop "<YouTube links>"   the message's videos loop on every page: one by itself, several in order; anybody can switch
@@ -106,6 +115,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from urllib.parse import urlparse
@@ -528,30 +538,60 @@ def connect(path: str = "/ws"):
 
 
 MEDIA_RE = re.compile(r"(?<![\w:.\/~-])(~?(?:/[\w.@+-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|pdf))(?![\w])", re.I)
+MEDIA_REL_RE = re.compile(r"(?<![\w:.\/~@+-])((?:\.{1,2}/)?[\w.@+-]+(?:/[\w.@+-]+)*\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|pdf))(?![\w])", re.I)
 
 
-def attach(ws, task: str, text: str) -> str:
-    """a picture or video named in a message by a path on THIS machine, when the server is on another one: sent to the
-    server, its path there put in the message instead (the page shows only the files the server can read)"""
-    if urlparse(URL).hostname in ("127.0.0.1", "localhost", "::1"):
-        return text
+def _own_file(full: str) -> bool:
+    """a file the command sends by itself when a message names it: one under the folder the agent works in or a temp folder,
+    with nothing hidden on the way down. Anything else of the machine - a message may only quote a path somebody else wrote,
+    and that must not publish the file - is sent with --send alone (the audit before 0.10.0)"""
+    home = os.path.realpath(os.path.expanduser("~"))
+    for r in dict.fromkeys(os.path.realpath(p) for p in (os.getcwd(), tempfile.gettempdir(), "/tmp")):
+        if (home + "/").startswith(r.rstrip("/") + "/") or not full.startswith(r.rstrip("/") + "/"):
+            continue                                     # the home folder or one above it is nobody's working folder
+        if not any(p.startswith(".") for p in full[len(r):].split("/")):
+            return True
+    return False
+
+
+def attach(ws, task: str, text: str, anywhere: bool = False) -> str:
+    """a picture, video or PDF named in a message by a path on THIS machine: sent to the server, its path there put in the
+    message instead - the page shows only the files of the server's own folders. So it is on the chat's own machine too
+    (the owner, #3647: a screenshot in a build or a temp folder came as a line of text, not as a picture); only a file that
+    is in the uploads folder there already stays as named. Only a full path is sent (a file's name in a sentence is not a
+    wish to show the file): one that is not full and names a file here gets a hint"""
+    local = urlparse(URL).hostname in ("127.0.0.1", "localhost", "::1")
+    ups = os.path.realpath(os.path.expanduser("~/agentchat-uploads"))
     done = {}
     for m in MEDIA_RE.finditer(text):
         path = m.group(1)
-        full = os.path.expanduser(path)                  # ~/out/x.png too (a ComfyUI agent's pictures were not sent, the owner #78)
-        if path in done or not os.path.isfile(full):
+        full = os.path.realpath(os.path.expanduser(path))  # ~/out/x.png too (a ComfyUI agent's pictures were not sent, the owner #78)
+        if path in done:
+            continue
+        if not os.path.isfile(full):
+            if "agentchat-uploads/" not in path:
+                print(f"agentchat: {path} is not a file here - the page will show it as text, not as a picture", file=sys.stderr)
+            continue
+        if local and os.path.dirname(full) == ups:
+            continue
+        if not anywhere and not _own_file(full):
+            print(f"agentchat: {path} was not sent: it is outside the folder you work in and the temp folders. If you mean to show "
+                  f"this very file, say it again with --send", file=sys.stderr)
             continue
         if os.path.getsize(full) > 20 * 2 ** 20:
             print(f"agentchat: {path} is over 20 MB - not sent, the page will not show it", file=sys.stderr)
             continue
         try:
             with open(full, "rb") as f:
-                r = call(ws, {"op": "upload", "task": task, "name": os.path.basename(path), "data": base64.b64encode(f.read()).decode()})
+                r = call(ws, {"op": "upload", "task": task, "name": os.path.basename(full), "data": base64.b64encode(f.read()).decode()})
         except SystemExit as x:                          # an older server, a bad file: the message still goes, with the path as it was
             print(f"agentchat: {path} not sent ({x}) - the page will not show it", file=sys.stderr)
             continue
         done[path] = r["path"]
         print(f"sent {path} -> {r['path']}")
+    for m in MEDIA_REL_RE.finditer(text):
+        if os.path.isfile(m.group(1)):
+            print(f"agentchat: {m.group(1)} was not sent - for the page to show it, name it by its full path: {os.path.abspath(m.group(1))}", file=sys.stderr)
     return MEDIA_RE.sub(lambda m: done.get(m.group(1), m.group(1)), text)
 
 
@@ -664,19 +704,67 @@ def collect_skills() -> list[dict]:
     if claude:
         skill_dir(home / ".claude/skills")
         command_dir(home / ".claude/commands")
+        # the skills that come with the account (claude.ai's own and the uploaded ones): the session calls them anthropic-skills:<name>.
+        # They lie a folder deeper, so none was told (the owner, #3564: his uploaded skill was not in the list)
+        for acct in sorted((home / ".claude/skills/synced").glob("[!.]*")):
+            skill_dir(acct, "anthropic-skills:")
     if cursor:
         skill_dir(home / ".cursor/skills-cursor")
         skill_dir(home / ".cursor/skills")
         command_dir(home / ".cursor/commands")
     if codex:
         command_dir(home / ".codex/prompts")
-    for ver in sorted((home / ".claude/plugins/cache").glob("*/*/*")) if claude else []:   # plugins: <marketplace>/<plugin>/<version>
-        plugin = ver.parent.name
-        for f in sorted(ver.rglob("SKILL.md"))[:60]:
+    # the plugins (the owner, #3562): every skill and command of a plugin goes by <plugin>:<name>
+    for root, name in [*(_claude_plugins(home, roots) if claude else []), *(_cached_plugins(home / ".codex/plugins/cache") if codex else [])]:
+        for m in (".claude-plugin", ".codex-plugin"):                 # the name the plugin gives itself, else its folder's
+            try:
+                name = str(json.loads((root / m / "plugin.json").read_text()).get("name") or name)
+                break
+            except (OSError, ValueError, AttributeError):
+                pass
+        for f in sorted(root.rglob("SKILL.md"))[:60]:
             n, d = _front(f)
-            add(n or f.parent.name, d, plugin + ":")
-        command_dir(ver / "commands", plugin + ":")
+            add(n or f.parent.name, d, name + ":")
+        command_dir(root / "commands", name + ":")
     return [{"n": n, "d": d} for n, d in found.items()]
+
+
+def _cached_plugins(cache: Path) -> list[tuple[Path, str]]:
+    """<cache>/<marketplace>/<plugin>/<version>: the newest version of each plugin there, with the plugin's folder name"""
+    out = []
+    for p in sorted(cache.glob("*/*")):
+        try:
+            vers = [v for v in p.iterdir() if v.is_dir() and not v.name.startswith(".")]
+            if vers:
+                out.append((max(vers, key=lambda v: v.stat().st_mtime), p.name))
+        except OSError:
+            pass
+    return out
+
+
+def _claude_plugins(home: Path, roots: list[Path]) -> list[tuple[Path, str]]:
+    """the folders of the plugins a Claude Code session started here has, each with a name for one without a manifest: the
+    installed ones (installed_plugins.json: for everybody, or for a project this folder is in) that the settings do not
+    switch off (enabledPlugins: the user's, then the project's, then its local ones), and the ones that come with the
+    account (plugins/synced). Before, every version of everything in the cache was listed - a plugin switched off and an
+    old version too - and the account's plugins were not (the owner, #3562)"""
+    base, off = home / ".claude/plugins", set()
+    for f in [home / ".claude/settings.json", *[r / ".claude" / n for r in reversed(roots) for n in ("settings.json", "settings.local.json")]]:
+        try:
+            for k, v in (json.loads(f.read_text()).get("enabledPlugins") or {}).items():
+                (off.discard if v else off.add)(k)
+        except (OSError, ValueError, AttributeError):
+            pass
+    out: list[tuple[Path, str]] = []
+    try:
+        here = {str(r) for r in roots}
+        for pid, entries in json.loads((base / "installed_plugins.json").read_text())["plugins"].items():
+            for e in entries if isinstance(entries, list) else []:
+                if pid not in off and isinstance(e, dict) and e.get("installPath") and (e.get("scope") == "user" or str(e.get("projectPath") or "") in here):
+                    out.append((Path(e["installPath"]), pid.split("@")[0]))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        out = _cached_plugins(base / "cache")                         # no list of the installed ones: what the cache has
+    return out + [(m.parent.parent, m.parent.parent.name) for m in sorted(base.glob("synced/*/*/.claude-plugin/plugin.json"))]
 
 
 # GitHub through gh (the owner, #1083/#1091): an agent's pull request on its card, a PR's card under a message that names it
@@ -1015,6 +1103,9 @@ def main() -> None:
         loop = "--loop" in a                     # its YouTube videos play in a loop: one by itself, several in order (the owner, #1790)
         if loop:
             a.remove("--loop")
+        send = "--send" in a                     # the files named by a full path are sent wherever they lie (see _own_file)
+        if send:
+            a.remove("--send")
         doc = None
         if "--doc" in a:                         # a long text folded under the message (a SKILL.md to confirm): the page shows
             i = a.index("--doc")                 # it on a click and lets a person edit it - the edit comes back as a reply
@@ -1033,9 +1124,9 @@ def main() -> None:
                 raise SystemExit(f"agentchat say --doc: {path} is {len(body)} chars, 20000 at most")
             doc = {"name": name, "text": body}
         if not a:
-            raise SystemExit('agentchat say [--to NAME] [--reply ID] [--loop] [--doc FILE [--doc-name NAME]] "<message>"')
+            raise SystemExit('agentchat say [--to NAME] [--reply ID] [--loop] [--send] [--doc FILE [--doc-name NAME]] "<message>"')
         with connect() as ws:
-            r = call(ws, {"op": "say", "task": task, "text": attach(ws, task, " ".join(a)), "to": to, "reply": reply, "doc": doc, **({"loop": True} if loop else {})})
+            r = call(ws, {"op": "say", "task": task, "text": attach(ws, task, " ".join(a), send), "to": to, "reply": reply, "doc": doc, **({"loop": True} if loop else {})})
             print(f'#{r.get("id")}')                    # its id: for a --reply to it (superman, #1098)
             if r.get("note"):
                 print(r["note"], file=sys.stderr)       # @all by one who may not: the message went, as plain text
@@ -1317,6 +1408,30 @@ def main() -> None:
             print(f'#{p["id"]} {stamp(p["ts_msg"], "%m-%d %H:%M")} {p["agent"]}: {p["text"][:100]}   (pinned by {p["by"]})')
         if not r["pins"]:
             print("nothing is pinned")
+    elif cmd == "pr-guide":                      # superman's review guide for a pull request (the owner #3591); alone: the kept one
+        if not a or "#" not in a[0]:
+            raise SystemExit("agentchat pr-guide <owner>/<repo>#<n> [<guide.json> | --remove]")
+        q = {"op": "pr_guide", "task": task, "pr": a[0]}
+        if "--remove" in a[1:]:
+            q["remove"] = True
+        elif len(a) > 1:
+            try:
+                q["guide"] = json.loads(Path(a[1]).expanduser().read_text())
+            except (OSError, ValueError) as x:
+                raise SystemExit(f"agentchat pr-guide: {a[1]}: {x}")
+        with connect() as ws:
+            r = call(ws, q)
+        g = r.get("guide")
+        if not g:
+            print(f"no guide for {a[0]}")
+        else:
+            print(f'{a[0]}: by {g["by"]} {stamp(g["ts"], "%m-%d %H:%M")}, head {g["head"][:9] or "?"}: {sum(len(x["files"]) for x in g["groups"])} files in '
+                  f'{len(g["groups"])} groups, {len(g["crucial"])} crucial changes, words about {len(g.get("about") or {})} files, '
+                  + ("an overview" if g.get("summary") else "no overview") + (f'\n  {g["note"]}' if g["note"] else ""))
+            for x in g["groups"]:
+                print(f'  {x["title"] or "-"}: {len(x["files"])}')
+            for x in g["crucial"]:
+                print(f'  ! {x["path"]}' + (f':{x["line"]}' if x.get("line") else "") + (" (old)" if x.get("side") == "old" else "") + f'  {x["why"]}')
     elif cmd == "doc":                           # the document a message carries: to a file (or the screen)
         if not a or not a[0].lstrip("#").isdigit():
             raise SystemExit("agentchat doc <message id> [--out FILE]")

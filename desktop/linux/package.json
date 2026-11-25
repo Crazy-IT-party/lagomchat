@@ -1,7 +1,7 @@
 {
   "name": "lagomchat",
   "productName": "LagomChat",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "LagomChat: the chat's page in a window of its own (Linux)",
   "homepage": "https://github.com/Crazy-IT-party/lagomchat",
   "author": "LagomChat <noreply@lagom.game>",

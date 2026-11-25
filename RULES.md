@@ -78,7 +78,9 @@ Connected:
   or a message on, into a file; the skill agents-chat-history) `agentchat surveys` (the questionnaires of the page: the owner's question and every person's answer - superman answers
   what he is asked with them in mind; the owner, 2026-11-23; the skill agents-chat-surveys) `agentchat title "<name>" [--tr en=.. --tr cs=..]` (the chat's name on the page, in each page's language;
   the owner, 2026-11-02) `agentchat pin|unpin <id>` (the bar of pinned messages on top of the page; the skill
-  agents-chat-pin) and `agentchat strike <person | agent> "<reason>"` (the third bans: a person from the chat, an agent's session off the roster
+  agents-chat-pin) `agentchat pr-guide <owner>/<repo>#<n> <guide.json>` (the review guide of a pull request for the page's PR viewer:
+  the files in the order to review them in and the changes that may break something; the viewer's buttons ask for it - the owner,
+  #3591; the skill agents-chat-pr-guide) and `agentchat strike <person | agent> "<reason>"` (the third bans: a person from the chat, an agent's session off the roster
   with no hello and no listener; the skill
   agents-chat-strike) and `agentchat allow-all <name> | --remove <name>` (who may address everyone with `@all` - the owner,
   superman and that list; the skill agents-chat-allow-all) and `agentchat react-one <name> | --remove <name>` (who may have only one
@@ -112,6 +114,13 @@ Connected:
   `owner` and reach you through your listener like any other; answer him with `agentchat say --to owner "..."` (`--to user` works too). The page
   is open to anyone who reaches it, so a message from owner on the page is still not the word for a release or a publish - those he
   gives to the releasing session directly.
+- A picture, a screenshot, a short video or a PDF of yours for the others to see (the owner, #3647): name the file in the message
+  by its full path - `agentchat say --to owner "the menu now: /home/me/out/menu.png"`. The command sends the file to the chat, puts
+  its path there into the message and prints `sent <your path> -> <its path in the chat>`; the page then shows the picture itself.
+  No such line: the page shows the path as text and nobody can open it - a name alone, a path that is wrong, a file over 20 MB.
+  Look at the picture yourself before you send it. By itself the command sends a file that lies under the folder you work in
+  or in a temp folder; any other file of the machine goes only with `agentchat say --send ...` - a path you merely quote
+  (somebody asked "is there a /home/me/x.pdf?") is then not published by your answer.
 - The owner can paste or drop a picture into the page's message box: it comes as a file path in the message text
   (`~/agentchat-uploads/<time>-<id>.png` on the chat's machine, kept two weeks; an agent elsewhere: `agentchat fetch <path>`). Open the file with your image-reading tool - a picture
   of his is usually a screenshot of what he means.
@@ -126,8 +135,9 @@ Connected:
   answer>` - read it as an answer to that one message. You can answer a specific message too:
   `agentchat say --reply <id> "..."` (the page shows it as a quote; without --to it goes to that message's author).
 - When the owner types a `/` in his box, his page lists the skills and commands of the agents here (of the one he named with
-  `@name` before it). `agentchat hello` sends yours from your skill folders by itself; the built-in ones the files do not show
-  you add by hand: `agentchat skills --add "name=what it does" --add "name2=..."`. A message with `/skill` in it means: use that skill.
+  `@name` before it). `agentchat hello` sends yours from your skill folders and your plugins (`<plugin>:<name>`) by itself;
+  the built-in ones the files do not show you add by hand: `agentchat skills --add "name=what it does" --add "name2=..."`.
+  A message with `/skill` in it means: use that skill.
 - Subagents don't join: the agent that started them speaks for them.
 - `AGENTS-TALK.md` was the old way; the chat replaces it.
 

@@ -32,6 +32,7 @@ from html import escape as html_escape
 import asyncio
 import base64
 import bisect
+import contextlib
 import fcntl
 import hashlib
 import importlib
@@ -41,7 +42,9 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
+import signal
 import socket
 import tempfile
 import urllib.parse
@@ -375,6 +378,17 @@ class Chat:
                     self.trans[int(r_["id"])] = {k: r_[k] for k in ("lang", "en", "by") if k in r_}
                 except (ValueError, KeyError):
                     pass
+        # what a voice message made by live captions says, in other languages (the owner, #3617): message id -> {language: text}
+        self.cctr_file = DATA / "cc_trans.jsonl"
+        self.cctr: dict[int, dict[str, str]] = {}
+        if self.cctr_file.exists():
+            for s_ in self.cctr_file.read_text().splitlines():
+                try:
+                    r_ = json.loads(s_)
+                    self.cctr.setdefault(int(r_["id"]), {})[str(r_["lang"])] = str(r_["text"])
+                except (ValueError, KeyError):
+                    pass
+        TR.fallback = self.img.url
         self.acks_file = DATA / "acks.jsonl"
         self.acks: dict[int, dict[str, float]] = {}   # the owner's message id -> {agent name: when its listener / inbox got it}
         if self.acks_file.exists():
@@ -498,16 +512,24 @@ class Chat:
         """every agent name the whole log knows (hellos and renames): the page's filter, online or not"""
         return sorted({e["agent"] for e in self.events if e["kind"] in ("hello", "rename")})
 
-    def pins_view(self, start: int = 0) -> list[dict]:
-        """the pins as the page shows them, the newest pin last: the message's author and the start of its text"""
+    def pins_view(self) -> list[dict]:
+        """the pins as the page shows them, the newest pin last: the message's author and the start of its text. For everybody,
+        also the ones let in after the message was written (the owner, #3584): see `sees`"""
         byid = {e["id"]: e for e in self.events}
         out = []
         for p in self.pins:
             e = byid.get(p["id"])
-            if e and e["id"] >= start and e["id"] not in self.deleted:
+            if e and e["id"] not in self.deleted:
                 out.append({**p, "agent": e["agent"], "ts_msg": e["ts"], "text": " ".join((e["text"] or "").split())[:1500],
                             **({k: e[k] for k in ("kind", "sv", "cal") if e.get(k)} if e["kind"] != "msg" else {})})   # (the page draws one line: long enough for the links of its videos, #2041)
         return out
+
+    async def tell_pins(self) -> None:
+        """the pins to every open page, with the first message that page may load now (a pin may be older than its person)"""
+        pins = self.pins_view()
+        for ws in list(self.watchers):
+            me = self.viewers.get(ws) or {"role": "owner"}
+            await send(ws, json.dumps({"type": "pins", "pins": pins, "first": self.first_for(0 if me["role"] == "owner" else self.start_for(me))}, ensure_ascii=False))
 
     async def set_pin(self, mid: int, on: bool, by: str) -> str:
         """pin / unpin a message; '' or why not"""
@@ -519,9 +541,7 @@ class Chat:
             return ""
         self.pins = [p for p in self.pins if p["id"] != mid] + ([{"id": mid, "by": by, "ts": round(time.time(), 1)}] if on else [])
         self.pins_file.write_text(json.dumps(self.pins, ensure_ascii=False))
-        for ws in list(self.watchers):
-            me = self.viewers.get(ws) or {"role": "owner"}
-            await send(ws, json.dumps({"type": "pins", "pins": self.pins_view(0 if me["role"] == "owner" else self.start_for(me))}, ensure_ascii=False))
+        await self.tell_pins()
         print(f"[pin] {by}: {'+' if on else '-'}#{mid}", flush=True)
         return ""
 
@@ -633,20 +653,41 @@ class Chat:
             self.starts_file.write_text(json.dumps(self.starts))
         return self.starts[sid]
 
+    def sees(self, mid: int, start: int) -> bool:
+        """whether a person let in at `start` may see the message `mid`: what was written since, and what is pinned - a pin is
+        the owner's word that the message is for everybody in the chat (the owner, #3584)"""
+        return mid >= start or any(p["id"] == mid for p in self.pins)
+
+    async def tell_seers(self, mid: int, m: dict) -> None:
+        """a frame about the message `mid`: to the pages of those who may see it"""
+        s = json.dumps(m, ensure_ascii=False)
+        for ws in list(self.watchers):
+            me = self.viewers.get(ws) or {"role": "owner"}
+            if me["role"] == "owner" or self.sees(mid, self.start_for(me)):
+                await send(ws, s)
+
+    def first_for(self, start: int) -> int:
+        """the id of the first event such a person may load: where they came, or an older pinned message"""
+        if not self.events:
+            return 0
+        have = {p["id"] for p in self.pins} - self.deleted
+        old = [e["id"] for e in self.events if e["id"] < start and e["id"] in have] if have and min(have) < start else []
+        return min(old) if old else max(start, self.events[0]["id"])
+
     def view_for(self, e: dict, start: int, role: str) -> dict | None:
         """an event as this person sees it: None when it is from before they came (or a vote line, the owner's business); a quote of
         an earlier message and a note about one say only that it is earlier"""
-        if e["id"] < start:
+        if not self.sees(e["id"], start):
             return None
         e = self.public(e)
         if role == "owner":
             return e
         if e["kind"] == "vote":
             return None
-        if e.get("ref") is not None and e["ref"] < start:
+        if e.get("ref") is not None and not self.sees(e["ref"], start):
             e = dict(e, text="(about a message from before you came)")
         r = e.get("reply")
-        if r and r["id"] < start:
+        if r and not self.sees(r["id"], start):
             e = dict(e, reply={"id": r["id"], "agent": r["agent"], "text": "(a message from before you came)"})
         return e
 
@@ -736,17 +777,13 @@ class Chat:
         else:
             self.reacts.pop(mid, None)
         self.reacts_file.write_text(json.dumps(self.reacts, ensure_ascii=False))
-        m = json.dumps({"type": "react", "id": mid, "r": r}, ensure_ascii=False)
-        for ws in list(self.watchers):
-            me = self.viewers.get(ws) or {"role": "owner"}
-            if me["role"] == "owner" or mid >= self.start_for(me):
-                await send(ws, m)
+        await self.tell_seers(mid, {"type": "react", "id": mid, "r": r})
 
     async def poll_vote(self, mid: int, who: str, i: int, start: int = 0) -> str | None:
         """`who` picks option i of a poll, or takes the pick back (a click on it again); one pick, or several in a poll of several
         answers; everybody's pages see the counts at once (the owner, #1386)"""
         e = next((x for x in self.events if x["id"] == mid), None)
-        if not e or not e.get("poll") or mid in self.deleted or mid < start:
+        if not e or not e.get("poll") or mid in self.deleted or not self.sees(mid, start):
             return "no such poll"
         o = e["poll"]
         if not who or not isinstance(i, int) or not 0 <= i < len(o["o"]):
@@ -766,7 +803,7 @@ class Chat:
         self.polls_file.write_text(json.dumps(self.polls, ensure_ascii=False))
         for ws in list(self.watchers):
             me = self.viewers.get(ws) or {"role": "owner"}
-            if me["role"] == "owner" or mid >= self.start_for(me):
+            if me["role"] == "owner" or self.sees(mid, self.start_for(me)):
                 await send(ws, json.dumps({"type": "poll", "id": mid, **self.poll_view(mid, me.get("name") or "owner")}, ensure_ascii=False))
         return None
 
@@ -835,7 +872,7 @@ class Chat:
 
     async def vote(self, mid: int, d: int, rater: dict = RATER, start: int = 0) -> None:
         e = next((x for x in self.events if x["id"] == mid), None)
-        if not e or e["kind"] != "msg" or d not in (-1, 0, 1) or mid in self.deleted or mid < start:
+        if not e or e["kind"] != "msg" or d not in (-1, 0, 1) or mid in self.deleted or not self.sees(mid, start):
             return
         rid = str(rater["id"])
         if (rid == "owner" and e["task"] == "user") or e["task"] == rater.get("task") or e["task"] == "user:" + rid:
@@ -860,7 +897,7 @@ class Chat:
         sc = self.scores()
         for ws in list(self.watchers):                       # everybody sees the points; only the rater's own page gets the thumb
             me = self.viewers.get(ws) or {"role": "owner", "id": ""}
-            if me["role"] != "owner" and mid < self.start_for(me):
+            if me["role"] != "owner" and not self.sees(mid, self.start_for(me)):
                 continue
             await send(ws, json.dumps({"type": "vote", "id": mid, "d": d if str(self.rater_of(me)["id"]) == rid else None,
                                        "scores": sc, "tally": self.tally(mid)}, ensure_ascii=False))
@@ -935,11 +972,45 @@ class Chat:
         self.trans[mid] = r
         with self.trans_file.open("a") as f:
             f.write(json.dumps({"id": mid, **r}, ensure_ascii=False) + "\n")
-        for ws in list(self.watchers):
-            me = self.viewers.get(ws) or {"role": "owner", "id": ""}
-            if me["role"] == "owner" or mid >= self.start_for(me):
-                await send(ws, json.dumps({"type": "trans", "id": mid, **r}, ensure_ascii=False))
+        await self.tell_seers(mid, {"type": "trans", "id": mid, **r})
         return {"ok": True}
+
+    def cap_langs(self) -> set:
+        """the languages the pages showing live captions now read them in"""
+        return {v["capdst"] for v in self.viewers.values() if v and v.get("caps") and v.get("capdst")}
+
+    async def cap_tr(self, name: str, seg: str, text: str, src: str) -> None:
+        """a finished phrase of live captions, in the languages asked for: to every page, not kept"""
+        for dst in sorted(self.cap_langs() - {src})[:4]:
+            out = await TR.tr(text, src, dst, live=True)
+            await self.watch_all({"type": "captr", "name": name, "seg": seg, "lang": dst, **({"text": out} if out else {"err": True})})
+
+    async def cc_tr(self, e: dict, src: str, first: str) -> None:
+        """the words of a voice message made by live captions, in the language its speaker asked for and in those the
+        captions are read in now: kept, and shown under the message"""
+        words = e["text"].split("\n", 1)[1].strip()
+        for dst in [x for x in dict.fromkeys([first, *sorted(self.cap_langs())]) if x in CC_LANGS and x != src][:4]:
+            out = await TR.tr(words, src, dst)
+            if not out:
+                if first == dst:                         # the speaker's own page is told: its menu says the translator is silent
+                    await self.watch_all({"type": "captr", "name": e["agent"], "seg": "", "lang": dst, "err": True})
+                continue
+            if out.casefold() == words.casefold() or e["id"] in self.deleted:
+                continue
+            self.cctr.setdefault(e["id"], {})[dst] = out
+            with self.cctr_file.open("a") as f:
+                f.write(json.dumps({"id": e["id"], "lang": dst, "text": out}, ensure_ascii=False) + "\n")
+            await self.tell_seers(e["id"], {"type": "cctr", "id": e["id"], "lang": dst, "text": out})
+
+    def cctr_drop(self, ids) -> None:
+        """what purged or deleted speech said in other languages goes with it"""
+        if not any(i in self.cctr for i in ids):
+            return
+        for i in ids:
+            self.cctr.pop(i, None)
+        tmp = self.cctr_file.with_name(self.cctr_file.name + ".tmp")
+        tmp.write_text("".join(json.dumps({"id": i, "lang": k, "text": t}, ensure_ascii=False) + "\n" for i, d in self.cctr.items() for k, t in d.items()))
+        os.replace(tmp, self.cctr_file)
 
     async def typing(self, ws, me: dict) -> None:
         """a person types in the box: everybody else's page gets the name (at most once per 1.5 s from one page)"""
@@ -973,11 +1044,7 @@ class Chat:
         await asyncio.to_thread(self.pvec.drop, {mid})
         await self.talks_forget({mid})
         self.pics_of(e)
-        m = json.dumps({"type": "edit", "id": mid, "text": text, "edited": now}, ensure_ascii=False)
-        for ws in list(self.watchers):
-            v = self.viewers.get(ws) or {"role": "owner", "id": ""}
-            if v["role"] == "owner" or mid >= self.start_for(v):
-                await send(ws, m)
+        await self.tell_seers(mid, {"type": "edit", "id": mid, "text": text, "edited": now})
         print(f"[edit] #{mid} by {me.get('name')}", flush=True)
         return ""
 
@@ -988,7 +1055,7 @@ class Chat:
         """messages that stood on this person's screen (the owner, #2930): one view per person and message"""
         rid, now, new = str(self.rater_of(me)["id"]), round(time.time(), 3), []
         for mid in ids[:200]:
-            if not isinstance(mid, int) or isinstance(mid, bool) or mid < start or mid in self.deleted or rid in self.views.get(mid, ()):
+            if not isinstance(mid, int) or isinstance(mid, bool) or not self.sees(mid, start) or mid in self.deleted or rid in self.views.get(mid, ()):
                 continue
             i = bisect.bisect_left(self.events, mid, key=lambda x: x["id"])
             if i < len(self.events) and self.events[i]["id"] == mid and self.events[i]["kind"] == "msg":
@@ -1004,7 +1071,7 @@ class Chat:
         for ws in list(self.watchers):
             v = self.viewers.get(ws) or {"role": "owner", "id": ""}
             st = 0 if v["role"] == "owner" else self.start_for(v)
-            cnt = {str(mid): len(self.views[mid]) for mid in new if mid >= st}
+            cnt = {str(mid): len(self.views[mid]) for mid in new if self.sees(mid, st)}
             if cnt:
                 await send(ws, json.dumps({"type": "views", "v": cnt, **({"mine": new} if str(self.rater_of(v)["id"]) == rid else {})}))
 
@@ -1022,6 +1089,7 @@ class Chat:
             msg, agent = self.rated(e)
             await self.to_mongo({"id": mid, "set": {"deleted": {"by": RATER, "ts": now}}, "insert": {"message": msg, "agent": agent}})
         await self.watch_all({"type": "del", "id": mid})
+        self.cctr_drop({mid})
         if e["kind"] == "msg":
             await self.talks_forget({mid})
         print(f"[del] #{mid} ({e['kind']} of {e.get('agent')})", flush=True)
@@ -1086,20 +1154,20 @@ class Chat:
             self.pic_text.pop(i, None)
             for p in self.pics.pop(i, ()):
                 self.pic_ids.get(p, set()).discard(i)
+        self.cctr_drop(ids)
         await self.watch_all({"type": "purged", "ids": sorted(ids), "first": self.events[0]["id"] if self.events else 0})
         if any(p["id"] in ids for p in self.pins):
             self.pins = [p for p in self.pins if p["id"] not in ids]
             self.pins_file.write_text(json.dumps(self.pins, ensure_ascii=False))
-            for ws in list(self.watchers):
-                me = self.viewers.get(ws) or {"role": "owner"}
-                await send(ws, json.dumps({"type": "pins", "pins": self.pins_view(0 if me["role"] == "owner" else self.start_for(me))}, ensure_ascii=False))
+            await self.tell_pins()
         print(f"[purge] {by}: {len(ids)} lines -> {arch}", flush=True)
         return str(arch)
 
     def hears(self, e: dict, task: str) -> bool:
         """an event the agent of `task` hears: not its own; a message to others only when it is one of them"""
-        if e["task"] == task or e["id"] in self.deleted or e["kind"] in PEOPLE_KINDS:
-            return False                                 # a person coming or going is for the page: it wakes no agent
+        if e["task"] == task or e["id"] in self.deleted or e["kind"] in PEOPLE_KINDS or e.get("cc"):
+            return False                                 # a person coming or going is for the page: it wakes no agent; nor does
+                                                         # speech kept by live captions (#3617): a call is not a talk with the agents
         a = self.agents.get(task)
         return not e.get("to") or bool(a and a["name"] in e["to"])
 
@@ -1182,7 +1250,7 @@ class Chat:
         a2 = self.agents.get(a["task"])
         cleared = bool(a2 and kind in ("msg", "bye") and a2.pop("working", None))
         await self.fanout(e)
-        if kind in ("msg", "remind") and PUSH.subs:
+        if kind in ("msg", "remind") and PUSH.subs and not e.get("cc"):
             asyncio.create_task(push_out(self, e))           # Web Push to the people whose pages are closed (the owner, #1445)
         if kind == "msg" and a["task"] not in self.agents:
             self.agent_run, self.agent_paused = 0, False         # a person spoke: the agents' count starts again (#2285)
@@ -1449,7 +1517,7 @@ class Chat:
         for ws in list(self.watchers):
             me = self.viewers.get(ws)
             if me and me["role"] != "owner" and m.get("type") in ("ack", "del"):
-                if m.get("id", 0) < self.start_for(me):
+                if not self.sees(m.get("id", 0), self.start_for(me)):
                     continue
             await send(ws, s)
 
@@ -1717,6 +1785,21 @@ async def op(q: dict, ws) -> dict:
         return {"ok": False, "error": bad} if bad else {"ok": True, "pins": chat.pins_view()}
     if kind == "pins":
         return {"ok": True, "pins": chat.pins_view()}
+    if kind == "pr_guide":
+        # superman's guide for reviewing a pull request in the page's viewer (the owner, #3591): the order of the files and the
+        # crucial changes; with no guide given: the one that is kept, for anybody
+        key = str(q.get("pr") or "")
+        if not PR_KEY_RE.fullmatch(key):
+            return {"ok": False, "error": "which pull request: <owner>/<repo>#<number>"}
+        if q.get("guide") is None and not q.get("remove"):
+            return {"ok": True, "guide": PR_GUIDES.get(key)}
+        if a["name"].lower() not in DEPUTY:
+            return {"ok": False, "error": "a pull request's review guide is superman's to give"}
+        g, bad = (None, "") if q.get("remove") else pr_guide_clean(q.get("guide"))
+        if bad:
+            return {"ok": False, "error": bad}
+        await pr_guide_set(key, g, a["name"])
+        return {"ok": True, "guide": PR_GUIDES.get(key)}
     if kind == "sticker_import":
         # a pack from Telegram by its link (the owner, #225): any agent here; it goes on in the background, status asks how far it is
         m = TG_PACK_RE.fullmatch(str(q.get("url") or "").strip())
@@ -2482,8 +2565,7 @@ def viewer_key(v: dict) -> str:
 async def api_alias(req: web.Request) -> web.Response:
     """POST {target, name, av}: the viewer's own name / picture for somebody, seen on her pages only; both empty - gone"""
     v = await need_viewer(req)
-    org, host = req.headers.get("Origin"), req.headers.get("X-Forwarded-Host") or req.headers.get("Host")
-    if org and urlparse(org).netloc not in (host, req.headers.get("Host")):
+    if _other_site(req):
         return web.json_response({"ok": False, "error": "refused: another site's page"}, status=403)
     try:
         q = await req.json()
@@ -3173,32 +3255,163 @@ def parse_diff(text: str) -> list[dict]:
     return files
 
 
+# a pull request GitHub will not hand the diff of - over 20000 lines or 300 files it answers 406, and gh pr diff fails (the owner,
+# #3590) - is compared on this machine: the PR's head and its merge base (GitHub's compare names it) are fetched alone, with no
+# history and no file bodies (--depth=1 --filter=blob:none), into a bare repository kept per GitHub repository for every chat of
+# this machine; git then takes the bodies of the changed files only. The text is the one gh pr diff gives for a smaller PR
+GIT = shutil.which("git") or next((p for p in ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git") if os.path.exists(p)), "")
+PR_GIT = Path(os.environ.get("LAGOMCHAT_PR_GIT", Path.home() / ".cache/lagomchat/pr-git"))
+_PRD_LOCKS: dict[str, asyncio.Lock] = {}             # one loading of a pull request at a time: the others wait for its answer
+PR_GIT_MAX = 2 * 2 ** 30                               # a repository grown over this is started again
+PR_GIT_ALL = 6 * 2 ** 30                               # all of them together: over this the ones not used for the longest go
+_PR_GIT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def _git(d: Path, *args: str, timeout: float = 120, limit: int = 30_000_000) -> tuple[int, bytes]:
+    """git in the bare repository d: only its own settings count (not the machine's: an address rewritten to ssh, a helper that
+    asks), GitHub is asked with gh's sign-in - a private repository - and never with a prompt"""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    p = None
+
+    async def run() -> tuple[int, bytes, bytes]:
+        """what git prints, read as it comes: an answer over `limit` is not waited for (nor held in memory)"""
+        out, err = bytearray(), bytearray()
+
+        async def errs() -> None:
+            while b := await p.stderr.read(1 << 14):
+                err[:] = (err + b)[-2000:]
+        et = asyncio.create_task(errs())
+        try:
+            while b := await p.stdout.read(1 << 16):
+                out.extend(b)
+                if len(out) > limit:
+                    raise OverflowError
+            await et
+            return await p.wait(), bytes(out), bytes(err)
+        finally:
+            et.cancel()
+    try:
+        # a group of its own: the helpers git starts (the download, the unpacking) are stopped with it
+        p = await asyncio.create_subprocess_exec(GIT, "-C", str(d), "-c", "credential.helper=", "-c", f"credential.helper=!{shlex.quote(GH)} auth git-credential",
+                                                 *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+                                                 start_new_session=True)
+        rc, out, err = await asyncio.wait_for(run(), timeout)
+    except (OSError, asyncio.TimeoutError, OverflowError) as x:
+        if p and p.returncode is None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        print(f"[pr] git {args[0]} in {d.name}: {'over ' + str(limit >> 20) + ' MB' if isinstance(x, OverflowError) else type(x).__name__}", flush=True)
+        return -1, b""
+    if rc:
+        print(f"[pr] git {args[0]} in {d.name}: {err.decode('utf-8', 'replace').strip()[-300:]}", flush=True)
+    return rc, out
+
+
+def _pr_git_dir(d: Path) -> bool:
+    """the folder of a repository's bare copy, emptied when it has grown too big; whether it is to be set up. The copies of
+    all repositories together are held to PR_GIT_ALL: the ones not used for the longest go first (not one in use now)"""
+    def size(x: Path) -> int:
+        n = 0
+        for f in x.rglob("*"):
+            try:
+                n += f.stat().st_size if f.is_file() else 0
+            except OSError:
+                pass
+        return n
+    if d.exists() and size(d) > PR_GIT_MAX:
+        shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    os.utime(d)
+    rest = sorted((x for x in PR_GIT.iterdir() if x.is_dir() and x != d), key=lambda x: x.stat().st_mtime, reverse=True)
+    total = size(d)
+    for x in rest:
+        total += size(x)
+        lock = _PR_GIT_LOCKS.get(x.name)
+        if total > PR_GIT_ALL and not (lock and lock.locked()):
+            shutil.rmtree(x, ignore_errors=True)
+    return not (d / "HEAD").exists()
+
+
+async def _pr_diff_local(repo: str, base: str, head: str) -> bytes | None:
+    """the diff of a pull request made here by git (see above); None when it could not be made"""
+    if not GIT or not all(re.fullmatch(r"[0-9a-f]{40}", x or "") for x in (base, head)):
+        return None
+    rc, out = await _gh("api", f"repos/{repo}/compare/{base}...{head}?per_page=1", "--jq", ".merge_base_commit.sha", timeout=30)
+    mb = out.decode("ascii", "replace").strip()
+    if rc != 0 or not re.fullmatch(r"[0-9a-f]{40}", mb):
+        return None
+    d = PR_GIT / (repo.lower().replace("/", "__") + ".git")
+    async with _PR_GIT_LOCKS.setdefault(d.name, asyncio.Lock()):
+        try:
+            new = await asyncio.to_thread(_pr_git_dir, d)
+        except OSError as x:
+            print(f"[pr] {d}: {x}", flush=True)
+            return None
+        t = time.time()
+        for a in ((("init", "-q", "--bare"), ("config", "remote.origin.url", f"https://github.com/{repo}.git"), ("config", "remote.origin.promisor", "true"),
+                   ("config", "remote.origin.partialclonefilter", "blob:none")) if new else ()):
+            if (await _git(d, *a, timeout=20))[0] != 0:
+                return None
+        if (await _git(d, "fetch", "-q", "--depth=1", "--filter=blob:none", "origin", mb, head, timeout=120))[0] != 0:
+            return None
+        rc, out = await _git(d, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", mb, head, timeout=180)
+        print(f"[pr] {repo} {head[:9]}: GitHub gives no diff, made here in {time.time() - t:.1f} s ({len(out) // 1024} KB){'' if rc == 0 else ' - failed'}", flush=True)
+        return out if rc == 0 else None
+
+
 async def api_pr_diff(req: web.Request) -> web.Response:
     await need_viewer(req)
     ref = _pr_ref(req)
     if not ref or not GH:
         return web.json_response({"ok": False, "error": "bad_request" if GH else "no_gh"})
-    repo, n = ref
+    return web.json_response(await _pr_diff(*ref))
+
+
+async def _pr_diff(repo: str, n: int, fresh: float = 60) -> dict:
+    """a pull request's changes as the viewer gets them, kept for a minute"""
     key = f"{repo}#{n}"
-    hit = _PRD_CACHE.get(key)
-    if hit and time.time() - hit[0] < 60:
-        return web.json_response(hit[1])
+    if len(_PRD_LOCKS) > 300:
+        for k in [k for k, lk in _PRD_LOCKS.items() if not lk.locked()]:
+            del _PRD_LOCKS[k]
+    async with _PRD_LOCKS.setdefault(key, asyncio.Lock()):   # asked twice at once: loaded once, the second gets the kept answer
+        hit = _PRD_CACHE.get(key)
+        if hit and time.time() - hit[0] < (fresh if hit[1].get("ok") else 60):
+            return hit[1]
+        res = await _pr_diff_load(repo, n)
+        if len(_PRD_CACHE) > 100:
+            _PRD_CACHE.clear()
+        _PRD_CACHE[key] = (time.time(), res)                 # a failure is kept for the minute too: it is not tried again at once
+        return res
+
+
+def _pr_files(text: str) -> list[dict]:
+    files = parse_diff(text)
+    for f in files:                                       # what a "viewed" mark is good for: the file's changes as they are now (#3591)
+        f["sig"] = hashlib.sha1(json.dumps([f["status"], f["old"], f["bin"], [[h["os"], h["ns"], [l[:2] for l in h["lines"]]] for h in f["hunks"]]],
+                                           ensure_ascii=False).encode()).hexdigest()[:12]
+    return files
+
+
+async def _pr_diff_load(repo: str, n: int) -> dict:
     rc, meta = await _gh("pr", "view", str(n), "-R", repo, "--json", "title,url,headRefOid,baseRefOid,headRefName,baseRefName,state", timeout=20)
     if rc != 0:
-        return web.json_response({"ok": False, "error": "not_found"})
+        return {"ok": False, "error": "not_found"}
+    try:
+        m = json.loads(meta)
+    except ValueError:
+        return {"ok": False, "error": "gh_failed"}
     rc, out = await _gh("pr", "diff", str(n), "-R", repo, timeout=60)
-    if rc != 0:
-        return web.json_response({"ok": False, "error": "gh_failed"})
-    m = json.loads(meta)
-    files = parse_diff(out.decode("utf-8", "replace"))
+    if rc != 0:                                           # too big for GitHub's own diff (406): git makes it here
+        out = await _pr_diff_local(repo, m.get("baseRefOid", ""), m.get("headRefOid", ""))
+        if out is None:
+            return {"ok": False, "error": "gh_failed"}
+    files = await asyncio.to_thread(_pr_files, out.decode("utf-8", "replace"))   # a big one takes seconds: not on the chat's own thread
     big = sum(len(h["lines"]) for f in files for h in f["hunks"]) > 60000
-    res = {"ok": True, "repo": repo, "n": n, "title": m.get("title", ""), "url": m.get("url", ""), "state": m.get("state", ""),
-           "head": m.get("headRefOid", ""), "base": m.get("baseRefOid", ""), "head_ref": m.get("headRefName", ""), "base_ref": m.get("baseRefName", ""),
-           "files": files if not big else [dict(f, hunks=f["hunks"] if len(files) < 2 else [], cut=True) for f in files], "big": big}
-    if len(_PRD_CACHE) > 100:
-        _PRD_CACHE.clear()
-    _PRD_CACHE[key] = (time.time(), res)
-    return web.json_response(res)
+    return {"ok": True, "repo": repo, "n": n, "title": m.get("title", ""), "url": m.get("url", ""), "state": m.get("state", ""),
+            "head": m.get("headRefOid", ""), "base": m.get("baseRefOid", ""), "head_ref": m.get("headRefName", ""), "base_ref": m.get("baseRefName", ""),
+            "files": files if not big else [dict(f, hunks=f["hunks"] if len(files) < 2 else [], cut=True) for f in files], "big": big}
 
 
 async def api_pr_file(req: web.Request) -> web.Response:
@@ -3207,8 +3420,8 @@ async def api_pr_file(req: web.Request) -> web.Response:
     ref, path, sha = _pr_ref(req), req.query.get("path", ""), req.query.get("sha", "")
     if not ref or not GH or not re.fullmatch(r"[0-9a-f]{40}", sha) or not path or ".." in path.split("/") or len(path) > 400:
         return web.json_response({"ok": False, "error": "bad_request"})
-    d = (_PRD_CACHE.get(f"{ref[0]}#{ref[1]}") or (0, {}))[1]
-    if d and sha not in (d.get("head"), d.get("base")):
+    d = await _pr_diff(*ref, fresh=3600)                     # the one the viewer has open (asked anew after a restart of the chat)
+    if sha not in (d.get("head"), d.get("base")):
         return web.json_response({"ok": False, "error": "not this pull request's commit"})
     key = f"{ref[0]}@{sha}:{path}"
     if key not in _PRF_CACHE:
@@ -3230,8 +3443,7 @@ async def api_pr_comments(req: web.Request) -> web.Response:
     key = f"{ref[0]}#{ref[1]}"
     lst = PR_COMMENTS.setdefault(key, [])
     if req.method == "POST":
-        org = req.headers.get("Origin")
-        if org and urlparse(org).netloc not in (req.headers.get("X-Forwarded-Host"), req.headers.get("Host")):
+        if _other_site(req):
             return web.json_response({"ok": False, "error": "refused: another site's page"}, status=403)
         try:
             q = await req.json()
@@ -3257,6 +3469,139 @@ async def api_pr_comments(req: web.Request) -> web.Response:
     return web.json_response({"ok": True, "comments": PR_COMMENTS.get(key, [])})
 
 
+# ---- reviewing a pull request in the chat (the owner, #3591). The files a person has looked through leave their list: kept here
+# per person, so the same on every device of theirs; a file whose changes are not the same any more (a push) comes back - the mark
+# holds the fingerprint of the changes it was made on. And superman's guide for a pull request: the files in the order to review
+# them in, by groups (the server first, then the pages that use it), and the changes that may break something, each with a reason.
+# The page's buttons ask superman for it in the chat; he answers with `agentchat pr-guide` (the skill agents-chat-pr-guide)
+PR_VIEWED_FILE, PR_GUIDES_FILE = DATA / "pr_viewed.json", DATA / "pr_guides.json"
+
+
+def _json_file(p: Path) -> dict:
+    try:
+        d = json.loads(p.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+PR_VIEWED: dict[str, dict[str, dict[str, str]]] = _json_file(PR_VIEWED_FILE)     # "repo#n" -> the person -> path -> fingerprint
+PR_GUIDES: dict[str, dict] = _json_file(PR_GUIDES_FILE)                           # "repo#n" -> {groups, crucial, note, head, by, ts}
+PR_KEY_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#[0-9]{1,8}")
+
+
+def pr_guide_clean(g) -> tuple[dict | None, str]:
+    """superman's guide as it is kept: ({summary, about: {path: text}, groups: [{title, files}], crucial: [{path, line, side, why}],
+    note, head}, '') or (None, why not). summary: what the pull request changes as a whole; about: the same of one file and how it
+    hangs together with the others (#3600) - given as files: [{path, about}], or as it is kept"""
+    if not isinstance(g, dict):
+        return None, ("the guide is a JSON object: {summary, files: [{path, about}], groups: [{title, files: [path, ...]}], "
+                      "crucial: [{path, line, side, why}], note, head}")
+
+    def text(x, n: int) -> str:                              # the lines kept (paragraphs, a list), the spaces in them tidied
+        t = "\n".join(" ".join(ln.split()) for ln in str(x or "").splitlines())
+        return re.sub(r"\n{3,}", "\n\n", t).strip()[:n]
+    about = {}
+    fl = g.get("files") if g.get("files") is not None else g.get("about")
+    if isinstance(fl, dict):
+        fl = [{"path": k, "about": v} for k, v in fl.items()]
+    for x in fl or []:
+        if not isinstance(x, dict) or not isinstance(x.get("path"), str) or not x["path"] or not isinstance(x.get("about"), str):
+            return None, "files: a list of {path, about}"
+        if text(x["about"], 2000):
+            about[x["path"][:400]] = text(x["about"], 2000)
+    if len(about) > 5000 or sum(map(len, about.values())) > 600_000:
+        return None, "too much about the files (5000 files, 600 000 letters in all): a line or two for a file"
+    summary = text(g.get("summary"), 6000)
+    groups, crucial, n = [], [], 0
+    for x in g.get("groups") or []:
+        if not isinstance(x, dict) or not isinstance(x.get("files"), list):
+            return None, "groups: a list of {title, files: [path, ...]}"
+        fs = list(dict.fromkeys(str(f)[:400] for f in x["files"] if isinstance(f, str) and f))
+        n += len(fs)
+        if fs:
+            groups.append({"title": " ".join(str(x.get("title") or "").split())[:80], "files": fs})
+    if len(groups) > 100 or n > 5000:
+        return None, "too many groups or files (100 groups, 5000 files)"
+    for x in g.get("crucial") or []:
+        if not isinstance(x, dict) or not isinstance(x.get("path"), str) or not x["path"]:
+            return None, "crucial: a list of {path, line, side, why}"
+        line = x.get("line")
+        if line is not None and (not isinstance(line, int) or isinstance(line, bool) or line < 1):
+            return None, "crucial: line is a line number of the file (left out: the whole file)"
+        if x.get("side") not in (None, "new", "old"):
+            return None, "crucial: side is new (the file after the change, the default) or old"
+        crucial.append({"path": x["path"][:400], **({"line": line} if line else {}), **({"side": "old"} if x.get("side") == "old" else {}),
+                        "why": " ".join(str(x.get("why") or "").split())[:300]})
+    if len(crucial) > 500:
+        return None, "too many crucial changes (500): name the ones a reviewer must not miss"
+    if not groups and not crucial and not summary and not about:
+        return None, "an empty guide: give summary, files, groups or crucial"
+    head = str(g.get("head") or "")
+    return {"summary": summary, "about": about, "groups": groups, "crucial": crucial, "note": " ".join(str(g.get("note") or "").split())[:600],
+            "head": head if re.fullmatch(r"[0-9a-f]{40}", head) else ""}, ""
+
+
+async def pr_guide_set(key: str, g: dict | None, by: str) -> None:
+    if g is None:
+        PR_GUIDES.pop(key, None)
+    else:
+        PR_GUIDES[key] = {**g, "by": by, "ts": round(time.time(), 1)}
+    PR_GUIDES_FILE.write_text(json.dumps(PR_GUIDES, ensure_ascii=False))
+    print(f"[prg] {by}: {key} {'-' if g is None else '+'}", flush=True)
+    await chat.watch_all({"type": "prg", "pr": key, "guide": PR_GUIDES.get(key)})
+
+
+async def api_pr_review(req: web.Request) -> web.Response:
+    """a person's review of a pull request: GET {viewed: {path: fingerprint}, guide}; POST {path, sig, on} marks a file viewed or
+    not, {clear: true} takes every mark of theirs away"""
+    v = await need_viewer(req)
+    ref = _pr_ref(req)
+    if not ref:
+        return web.json_response({"ok": False, "error": "bad_request"})
+    key, vk = f"{ref[0]}#{ref[1]}", viewer_key(v)
+    mine = PR_VIEWED.get(key, {}).get(vk, {})
+    if req.method == "POST":
+        if _other_site(req):
+            return web.json_response({"ok": False, "error": "refused: another site's page"}, status=403)
+        try:
+            q = await req.json()
+        except ValueError:
+            q = {}
+        mine = dict(mine)
+        if q.get("clear"):
+            mine = {}
+        else:
+            path, sig = str(q.get("path") or ""), str(q.get("sig") or "")
+            if not path or len(path) > 400 or not re.fullmatch(r"[0-9a-f]{12}", sig) or not vk or (q.get("on") and len(mine) >= 5000 and path not in mine):
+                return web.json_response({"ok": False, "error": "bad_request"})
+            if q.get("on") and not mine and not (_PRD_CACHE.get(key) or (0, {}))[1].get("ok"):
+                return web.json_response({"ok": False, "error": "bad_request"})      # the first mark: of a pull request that was opened here
+            if q.get("on") and not mine:
+                for old in [k for k, per in PR_VIEWED.items() if vk in per][:-299]:   # the person's oldest ones go
+                    PR_VIEWED[old].pop(vk, None)
+                    if not PR_VIEWED[old]:
+                        del PR_VIEWED[old]
+            if q.get("on"):
+                mine[path] = sig
+            else:
+                mine.pop(path, None)
+        per = PR_VIEWED.setdefault(key, {})
+        if mine:
+            per[vk] = mine
+        else:
+            per.pop(vk, None)
+        if not per:
+            PR_VIEWED.pop(key, None)
+        PR_VIEWED_FILE.write_text(json.dumps(PR_VIEWED, ensure_ascii=False))
+        m = json.dumps({"type": "prv", "pr": key, "viewed": mine}, ensure_ascii=False)
+        for ws in list(chat.watchers):                    # the person's other pages: the same list there
+            me = chat.viewers.get(ws)
+            if me and viewer_key(me) == vk:
+                await send(ws, m)
+    return web.json_response({"ok": True, "viewed": mine, "guide": PR_GUIDES.get(key)})
+
+
 async def api_chats(req: web.Request) -> web.Response:
     """the chats on this Mac (chats.py, the owner, 2026-11-07): GET the list for the sidebar; POST {op: create|stop|start|delete,
     title, slug} - the owner only, from this host's own page"""
@@ -3267,8 +3612,7 @@ async def api_chats(req: web.Request) -> web.Response:
     here = _chat_url(here if here.startswith(("127.", "localhost")) else here.split(":")[0])
     args, tmp = ["list"], None
     if req.method == "POST":
-        org = req.headers.get("Origin")
-        if org and urlparse(org).netloc not in (req.headers.get("X-Forwarded-Host"), req.headers.get("Host")):
+        if _other_site(req):
             return web.json_response({"ok": False, "error": "refused: another site's page"}, status=403)
         try:
             q = await req.json()
@@ -3538,6 +3882,21 @@ def _seen_load() -> dict:
         return {}
 
 
+def _seen_url(req: web.Request) -> str:
+    """this chat's address as the person's browser has it: the key of what they read here"""
+    host = req.headers.get("X-Forwarded-Host") or req.host
+    return _chat_url(host if host.startswith(("127.", "localhost")) else host.split(":")[0])
+
+
+def _seen_here(req: web.Request, v: dict) -> int:
+    """the last message of this chat the person has read, on any device of theirs (by the email); 0: not known"""
+    cur = _seen_load().get(str(v.get("em") or "").lower())
+    try:
+        return int(cur.get(_seen_url(req)) or 0) if isinstance(cur, dict) and v.get("em") else 0
+    except (ValueError, TypeError):
+        return 0
+
+
 async def api_agent_color(req: web.Request) -> web.Response:
     """the owner sets the colour of an agent's name (#1900): {name, color: "#rrggbb" | ""}; empty = the agent's own again"""
     v = await need_viewer(req)
@@ -3571,7 +3930,8 @@ def _chat_url(host: str) -> str:
 
 
 async def api_seen(req: web.Request) -> web.Response:
-    """the last message id read in this chat, by the person's email, for the other chats' circles (the owner, #1860)"""
+    """the last message id read in this chat, by the person's email, for the other chats' circles (the owner, #1860) and for
+    the person's other pages of this chat: a phone does not open at what was read on the computer (the owner, #3572)"""
     v = await viewer_of(req)
     em = str(v.get("em") or "").lower()
     if not em or v["role"] not in ("owner", "verified"):       # one who waits to be let in writes nothing
@@ -3581,8 +3941,7 @@ async def api_seen(req: web.Request) -> web.Response:
         i = int(q.get("id") or 0)
     except (ValueError, TypeError, AttributeError):
         return web.json_response({"ok": False}, status=400)
-    host = req.headers.get("X-Forwarded-Host") or req.host
-    url = _chat_url(host if host.startswith(("127.", "localhost")) else host.split(":")[0])
+    url = _seen_url(req)
     d = _seen_load()
     cur = d.get(em) if isinstance(d.get(em), dict) else {}
     if i > int(cur.get(url) or 0):
@@ -3592,6 +3951,9 @@ async def api_seen(req: web.Request) -> web.Response:
         tmp = SEEN_FILE.with_name(f"{SEEN_FILE.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(d))
         tmp.replace(SEEN_FILE)
+        for w, x in list(chat.viewers.items()):
+            if str(x.get("em") or "").lower() == em:
+                await send(w, json.dumps({"type": "seen", "id": i}))
     return web.json_response({"ok": True})
 
 
@@ -3773,6 +4135,105 @@ ELEVEN_API = os.environ.get("LAGOMCHAT_ELEVEN_API", "https://api.elevenlabs.io")
 _stt_last: dict[str, float] = {}
 
 
+# Live captions in another language, and speech kept as voice messages (the owner, #3617, #3621, #3622). CC_LANGS: the languages
+# a person may say they speak and may read captions in. The translating is done by a model server of our own, an OpenAI-compatible
+# /v1/chat/completions: translate.json {"url": ..., "model": ..., "key": ..., "extra": {...}} in the chat's config folder or in
+# .lagomchat of the working copy; with none, the address in vision_url (the model that describes the pictures). What people say
+# goes nowhere else unless the owner puts another address there
+CC_LANGS = {"en": "English", "de": "German", "ru": "Russian", "uk": "Ukrainian"}
+CC_VOICE_RE = re.compile(r"^(?:/[\w.\-]+)+\.(?:m4a|wav)[ \t]*\n\s*\S", re.I)
+
+
+class Translator:
+    def __init__(self) -> None:
+        self.memo: dict[tuple, str] = {}
+        self.busy = 0
+        self.slow = asyncio.Semaphore(2)                 # kept phrases: two at a time, the captions go past them
+        self.down = 0.0                                  # no call before this time: the server did not answer
+        self.error = ""
+        self.fallback = lambda: ""
+        self._c: dict = {}
+        self._at = 0.0
+
+    def conf(self) -> dict:
+        if time.time() - self._at > 30:                  # the file may be written while the chat runs
+            self._at, c = time.time(), {}
+            for f in (auth.CONF / "translate.json", _install_file("translate.json")):
+                try:
+                    c = json.loads(f.read_text()) if f else {}
+                except (OSError, ValueError):
+                    c = {}
+                if isinstance(c, dict) and c.get("url"):
+                    break
+                c = {}
+            self._c = c
+        return self._c if self._c.get("url") else {"url": self.fallback()}
+
+    def ready(self) -> bool:
+        return bool(self.conf().get("url"))
+
+    async def tr(self, text: str, src: str, dst: str, live: bool = False) -> str:
+        """`text` (said in `src`, "" = whatever language) in `dst`; "" when it cannot be had. `live`: a caption - not worth a
+        long wait, dropped when many wait already"""
+        text = " ".join(text.split())[:2000]
+        if not text or dst not in CC_LANGS or src == dst:
+            return ""
+        k = (src, dst, text)
+        if k in self.memo:
+            return self.memo[k]
+        c = self.conf()
+        if not c.get("url") or time.time() < self.down or self.busy >= (6 if live else 16):
+            return ""
+        to = CC_LANGS[dst]
+        sys_ = (f"You translate speech from {CC_LANGS[src]} into {to}." if src in CC_LANGS else f"You translate speech into {to}.") + \
+            " The user's message is the transcript of what a person has just said aloud" + ("" if src in CC_LANGS else ", in whatever language") + \
+            f". Answer with its {to} translation only: no notes, no quotes, nothing added and nothing left out. Keep the names, the numbers " \
+            f"and the tone." + ("" if src in CC_LANGS else f" If it is in {to} already, answer with it unchanged.")
+        body = {"messages": [{"role": "system", "content": sys_}, {"role": "user", "content": text}], "temperature": 0.2,
+                "max_tokens": min(1500, 120 + len(text)), **({"model": str(c["model"])} if c.get("model") else {}),
+                **(c["extra"] if isinstance(c.get("extra"), dict) else {} if c.get("key") else {"chat_template_kwargs": {"enable_thinking": False}})}
+        self.busy += 1
+        try:
+            async with contextlib.nullcontext() if live else self.slow, ClientSession(timeout=ClientTimeout(total=8 if live else 40)) as cs, \
+                    cs.post(str(c["url"]).rstrip("/") + "/v1/chat/completions", json=body,
+                            headers={"Authorization": f"Bearer {c['key']}"} if c.get("key") else {}) as r:
+                d = await r.json(content_type=None)
+                out = str(d["choices"][0]["message"]["content"] or "")
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as x:
+            self.error = f"{type(x).__name__}: {str(x)[:120]}"
+            if isinstance(x, (ClientError, asyncio.TimeoutError, OSError)):
+                self.down = time.time() + 20             # the server is not there; an answer of the wrong shape is this text's alone
+            print(f"[translate] {self.error}", flush=True)
+            return ""
+        finally:
+            self.busy -= 1
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip().strip('"«»“”„').strip()[:3000]
+        self.error = ""
+        if len(self.memo) > 2000:
+            self.memo.clear()
+        if out:
+            self.memo[k] = out
+        return out
+
+
+TR = Translator()
+_CC_SAID: dict[str, list[float]] = {}                 # a person -> when their kept phrases came (the last minute)
+
+
+def _cc_may(me: dict, text: str) -> bool:
+    """a kept phrase of live captions is taken from this page: its sound is a file the page has just sent up, and the person
+    has not sent 20 in the last minute from all their pages (every one of them is a call to the translator)"""
+    p = Path(text.split("\n", 1)[0].strip())
+    if p.parent != UPLOADS or not p.is_file():
+        return False
+    now, k = time.time(), str(chat.rater_of(me)["id"])
+    said = _CC_SAID[k] = [t for t in _CC_SAID.get(k, []) if now - t < 60]
+    if len(said) >= 20:
+        return False
+    said.append(now)
+    return True
+
+
 def eleven_key() -> str:
     """The ElevenLabs key of this chat: its own (elevenlabs.token in its config folder), else the one of the whole install -
     .lagomchat/elevenlabs.token of the working copy, else the main chat's own - so one key serves every chat (the owner, #3167)"""
@@ -3857,20 +4318,21 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
     start = chat.start_for(me)
     evs = [v for v in (chat.view_for(e, start, me["role"]) for e in chat.events[-n:]) if v is not None]
     lo = max(start, evs[0]["id"] if evs else start)
-    await ws.send_str(json.dumps({"type": "init", "peer": me["peer"], "sps": {str(k): {**{x: v[x] for x in ("uri", "pos", "paused")}, "age": round(time.time() - v["at"], 2)} for k, v in chat.sps.items() if time.time() - v["at"] < 6 * 3600}, "me": {k: me[k] for k in ("role", "name", "id", "task", "avatar", "signed", "enforced", "acct_name")},
+    await ws.send_str(json.dumps({"type": "init", "seen": _seen_here(req, me), "peer": me["peer"], "sps": {str(k): {**{x: v[x] for x in ("uri", "pos", "paused")}, "age": round(time.time() - v["at"], 2)} for k, v in chat.sps.items() if time.time() - v["at"] < 6 * 3600}, "me": {k: me[k] for k in ("role", "name", "id", "task", "avatar", "signed", "enforced", "acct_name")},
                                   "presence": chat.presence(me["role"] == "owner", me),
                                   "agents": chat.roster(), "known": chat.known_agents(), "allow_all": chat.allow_all, "sound_presets": SOUND_PRESETS, "stt": bool(eleven_key()), "rimgs": _rimgs_out(), "photo": chat.photos.get(me.get("task") or ""), "loops": {str(i): v for i, v in chat.loops.items() if i >= lo}, "events": evs, "v": page_version(), "title": chat.title, "title_tr": chat.title_tr, "aliases": chat.aliases.get(viewer_key(me), {}), "names": chat.dnames, "agent_cols": chat.agent_cols,
                                   "acks": {str(i): v for i, v in chat.acks.items() if i >= lo},
-                                  "trans": {str(i): v for i, v in chat.trans.items() if i >= start},
-                                  "views": {str(i): len(v) for i, v in chat.views.items() if i >= start},
-                                  "viewed": (lambda rid: [i for i, v in chat.views.items() if i >= start and rid in v])(str(chat.rater_of(me)["id"])),
-                                  "pins": chat.pins_view(0 if me["role"] == "owner" else start),
-                                  "tally": {str(i): t for i in chat.votes if i >= start and (t := chat.tally(i))},
-                                  "polls": {str(i): chat.poll_view(i, me.get("name") or "owner") for i in chat.polls if i >= start},
+                                  "trans": {str(i): v for i, v in chat.trans.items() if chat.sees(i, start) and i not in chat.deleted},
+                                  "cctr": {str(i): v for i, v in chat.cctr.items() if chat.sees(i, start)}, "cc_tr": TR.ready(),
+                                  "views": {str(i): len(v) for i, v in chat.views.items() if chat.sees(i, start)},
+                                  "viewed": (lambda rid: [i for i, v in chat.views.items() if chat.sees(i, start) and rid in v])(str(chat.rater_of(me)["id"])),
+                                  "pins": chat.pins_view(),
+                                  "tally": {str(i): t for i in chat.votes if chat.sees(i, start) and (t := chat.tally(i))},
+                                  "polls": {str(i): chat.poll_view(i, me.get("name") or "owner") for i in chat.polls if chat.sees(i, start)},
                                   "cards": CARDS,
-                                  "reacts": {str(i): r for i, r in chat.reacts.items() if i >= start},   # all they may see, not only of the n newest: older messages come later with no reactions of their own (the owner, #1033)
-                                  "votes": {str(i): m[str(chat.rater_of(me)["id"])][1] for i, m in chat.votes.items() if i >= start and str(chat.rater_of(me)["id"]) in m}, "scores": chat.scores(),
-                                  "first": max(start, chat.events[0]["id"]) if chat.events else 0}, ensure_ascii=False))
+                                  "reacts": {str(i): r for i, r in chat.reacts.items() if chat.sees(i, start)},   # all they may see, not only of the n newest: older messages come later with no reactions of their own (the owner, #1033)
+                                  "votes": {str(i): m[str(chat.rater_of(me)["id"])][1] for i, m in chat.votes.items() if chat.sees(i, start) and str(chat.rater_of(me)["id"]) in m}, "scores": chat.scores(),
+                                  "first": chat.first_for(start)}, ensure_ascii=False))
     chat.watchers.add(ws)
     if not me["aux"]:
         await chat.person_came(me)
@@ -3959,14 +4421,19 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                     await chat.send_presence()
                 continue
             if q.get("caps_set") is not None:                    # this page shows live captions (#2756): speakers transcribe only while somebody reads
-                if _ws_rate(me, "caps_set", 2) and bool(q["caps_set"]) != bool(me.get("caps")):
-                    me["caps"] = bool(q["caps_set"])
-                    await chat.send_presence()
+                if _ws_rate(me, "caps_set", 4):
+                    me["capdst"] = q.get("caps_dst") if q["caps_set"] and q.get("caps_dst") in CC_LANGS else ""   # read in this language (#3621)
+                    if bool(q["caps_set"]) != bool(me.get("caps")):
+                        me["caps"] = bool(q["caps_set"])
+                        await chat.send_presence()
                 continue
             if isinstance(q.get("cap"), dict):                   # a piece of what this person says, from their own page: to every page, not kept
                 c = q["cap"]
                 if me["role"] in ("owner", "verified") and isinstance(c.get("text"), str) and _ws_rate(me, "cap", 12):
-                    await chat.watch_all({"type": "cap", "name": me["name"], "text": c["text"][:600], "final": bool(c.get("final")), "seg": str(c.get("seg") or "")[:24]})
+                    seg = str(c.get("seg") or "")[:24]
+                    await chat.watch_all({"type": "cap", "name": me["name"], "text": c["text"][:600], "final": bool(c.get("final")), "seg": seg})
+                    if c.get("final") and c["text"].strip() and chat.cap_langs():   # a finished phrase: in the languages read now
+                        asyncio.create_task(chat.cap_tr(me["name"], seg, c["text"][:600], c.get("lang") if c.get("lang") in CC_LANGS else ""))
                 continue
             if isinstance(q.get("ptt"), dict):                   # push to talk (#2773): the sound as it is spoken, to every page, not kept -
                 c = q["ptt"]                                     # the voice message itself comes after, as an upload a message names
@@ -4051,7 +4518,7 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                     mid = int(q["loop"])
                 except (TypeError, ValueError):
                     continue
-                if any(x["id"] == mid and x["kind"] == "msg" for x in chat.events[-5000:]) and mid >= start:
+                if any(x["id"] == mid and x["kind"] == "msg" for x in chat.events[-5000:]) and chat.sees(mid, start):
                     chat.loops[mid] = bool(q.get("on"))
                     chat.loops_file.write_text(json.dumps(chat.loops))
                     await chat.watch_all({"type": "loop", "mid": mid, "on": chat.loops[mid]})
@@ -4066,6 +4533,8 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                     st = {"uri": str(y.get("uri") or "")[:80], "pos": max(0, int(y.get("pos") or 0)), "paused": bool(y.get("paused")), "at": time.time()}
                 except (TypeError, ValueError):
                     continue
+                if not st["uri"].startswith("spotify:"):
+                    continue                                 # Spotify alone: videos are not watched together any more (the owner, #3655)
                 chat.sps[mid] = st
                 print(f"[spsync] #{mid} {me.get('name')} pos={st['pos']} paused={st['paused']}", flush=True)
                 m = json.dumps({"type": "spsync", "mid": mid, **{k: st[k] for k in ("uri", "pos", "paused")}, "age": 0}, ensure_ascii=False)
@@ -4167,8 +4636,15 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
             # "! <command>" from the owner to named agents (the owner): the listener of an agent started with
             # `agentchat listen --shell` runs it in its folder and answers with the output. Only the owner's page sets it; never @all
             shm = SHELL_RE.match(text) if me["role"] == "owner" and to and not every else None
-            await chat.post("msg", {"name": me["name"], "task": me["task"]}, text, to, reply=rep, doc=doc_of(q), all=every or None,
-                            sh=shm.group(1).strip() if shm else None)
+            # what live captions heard this person say up to a pause, as a voice message (the owner, #3617): marked, so the pages
+            # show where it is from; its words are then put into the language the speaker asked for
+            cc = q["cc"] if isinstance(q.get("cc"), dict) and me["role"] in ("owner", "verified") and CC_VOICE_RE.match(text) \
+                and not to and not rep and _ws_rate(me, "ccmsg", 1) and _cc_may(me, text) else None
+            ccl = cc.get("l") if cc and cc.get("l") in CC_LANGS else ""
+            e = await chat.post("msg", {"name": me["name"], "task": me["task"]}, text, to, reply=rep, doc=doc_of(q), all=every or None,
+                                sh=shm.group(1).strip() if shm else None, cc={"l": ccl} if cc is not None else None)
+            if cc is not None:
+                asyncio.create_task(chat.cc_tr(e, ccl, str(cc.get("to") or "")))
     finally:
         chat.watchers.discard(ws)
         chat.viewers.pop(ws, None)
@@ -4371,7 +4847,7 @@ def settings() -> dict:
 # named takes part, a new one too); a value is kept even when empty, so a key that is not there was never shared
 SHARED_PREFS = Path(os.environ.get("LAGOMCHAT_SHARED_PREFS", Path.home() / ".config/agentchat-chats/prefs.json"))
 PREF_KEYS = {"ac_theme", "ac_lang", "ac_tsz", "ac_tbs", "ac_sbs", "ac_side", "ac_enter", "ac_hidevotes", "ac_hidesys", "ac_hidetr",
-             "ac_joinsnd", "ac_awayafter", "ac_hideviews", "ac_cord", "ac_caps", "ac_mirror", "ac_micgain", "ac_agsort", "ac_agrev",
+             "ac_joinsnd", "ac_awayafter", "ac_hideviews", "ac_cord", "ac_caps", "ac_capsl", "ac_capst", "ac_capsv", "ac_mirror", "ac_micgain", "ac_agsort", "ac_agrev",
              "ac_ppsort", "ac_pprev", "ac_camfold", "ac_fold_roster", "ac_fold_sv", "ac_fold_cal", "ac_aside_w", "ac_aside_off",
              "sv_showlang", "sv_showtz", "sv_nocc",                    # what a chat keeps by the person: its page sets it there
              "pf_name", "pf_color", "pf_mono", "pf_yt", "pf_status", "pf_snd_in", "pf_snd_out", "pf_photo"}
@@ -4788,6 +5264,13 @@ async def api_sound_file(req: web.Request) -> web.StreamResponse:
 STICKERS_DIR = UPLOADS / "stickers"
 STICKER_MAX_BYTES, STICKERS_MAX = 2 * 2 ** 20, 3000
 STICKER_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def _other_site(req: web.Request) -> bool:
+    """a request another site's page sent from the person's browser: its Origin is not this host. One with no Origin (a
+    command line, not a browser's POST) is not"""
+    org = req.headers.get("Origin")
+    return bool(org) and urlparse(org).netloc not in (req.headers.get("X-Forwarded-Host"), req.headers.get("Host"))
 
 
 def _same_page(req: web.Request) -> bool:
@@ -6043,7 +6526,7 @@ async def api_events(req: web.Request):
     before = int(req.query.get("before", "0")) or chat.next_id
     n = max(1, min(int(req.query.get("n", "500")), 5000))
     got = [x for x in (chat.view_for(e, start, v["role"]) for e in chat.events if e["id"] < before) if x is not None][-n:]
-    return web.json_response({"events": got, "first": max(start, chat.events[0]["id"]) if chat.events else 0})
+    return web.json_response({"events": got, "first": chat.first_for(start)})
 
 
 PERF_KEYS = ("type", "from", "fetch", "conn", "ttfb", "resp", "kb", "dom", "ws", "init", "initkb", "paint", "pre", "net", "rtt", "mob")
@@ -6079,7 +6562,7 @@ async def api_days(req: web.Request):
         return web.json_response({"ok": False, "error": "y, m, tz"}, status=400)
     days: dict = {}
     for e in chat.events:
-        if e["kind"] != "msg" or e["id"] < start or not a <= e.get("ts", 0) < b or e["id"] in chat.deleted:
+        if e["kind"] != "msg" or not chat.sees(e["id"], start) or not a <= e.get("ts", 0) < b or e["id"] in chat.deleted:
             continue
         d = days.setdefault(datetime.fromtimestamp(e["ts"], tz).day, [e["id"], 0])
         d[0] = min(d[0], e["id"])
@@ -6142,6 +6625,75 @@ def _imp_view() -> dict:
     return {k: IMPORT.get(k) for k in ("run", "done", "total", "name", "added", "error")}
 
 
+# the folder picker of the import (the owner, #3598): the folder is chosen by clicks, not typed. The folders of the chat's
+# machine under the home folder and the disks plugged in - names of folders only, never of files, hidden ones left out
+IMP_DISKS = Path("/Volumes") if sys.platform == "darwin" else Path("/media")
+IMP_LS_MAX = 1000
+
+
+def _imp_ls(path: str, src: str) -> dict:
+    """one folder for the picker: {path, up, crumbs: [[name, path]], dirs: [{name, path, exp, t}], here, more}. `exp`, `here`:
+    the folder holds an export (result.json; of iMessage, chat.db). No path: where an export is most likely"""
+    home, mark = Path.home().resolve(), ("chat.db" if src == "im" else "result.json")
+    if path.strip():
+        p = Path(os.path.expanduser(path.strip()))
+    elif src == "im":
+        p = home / "Library" / "Messages"
+        p = p if p.is_dir() else home
+    else:
+        p = next((x for x in (home / "Downloads" / "Telegram Desktop", home / "Downloads") if x.is_dir()), home)
+    try:
+        p, disks = p.resolve(), IMP_DISKS.resolve()
+        root = home if p == home or home in p.parents else disks if disks in p.parents else None
+        if root is None or not p.is_dir() or any(x.startswith(".") for x in p.relative_to(root).parts):
+            raise tgimport.Bad("no_folder")
+    except (OSError, RuntimeError, ValueError):
+        raise tgimport.Bad("no_folder")
+
+    def has(d: Path) -> bool:
+        try:
+            return (d / mark).is_file()
+        except OSError:
+            return False
+
+    def sub(d: Path) -> list[Path]:
+        out = []
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    if not e.name.startswith(".") and e.is_dir():
+                        out.append(Path(e.path))
+                except OSError:
+                    pass
+        return out
+    try:
+        kids = sub(p)
+    except PermissionError:
+        raise tgimport.Bad("no_list")
+    except OSError:
+        raise tgimport.Bad("no_folder")
+    dirs = []
+    for d in kids[:IMP_LS_MAX]:
+        exp = has(d)
+        try:
+            t = int((d / mark).stat().st_mtime) if exp else 0
+        except OSError:
+            t = 0
+        dirs.append({"name": d.name, "path": str(d), "exp": exp, "t": t})
+    dirs.sort(key=lambda x: (not x["exp"], -x["t"], x["name"].lower()))
+    if p == home:                                            # the disks plugged in: at the end of the home folder's list
+        try:
+            for d in sorted(sub(disks), key=lambda x: x.name.lower()):
+                if d.resolve().parent == disks:              # not the link to the system's own disk
+                    dirs.append({"name": d.name, "path": str(d), "exp": has(d), "t": 0, "disk": True})
+        except OSError:
+            pass
+    rel = p.relative_to(root).parts
+    crumbs = [["", str(home)]] + [[n, str(root.joinpath(*rel[:i + 1]))] for i, n in enumerate(rel)]
+    return {"path": str(p), "up": crumbs[-2][1] if len(crumbs) > 1 else "", "crumbs": crumbs, "dirs": dirs, "here": has(p),
+            "more": len(kids) > IMP_LS_MAX}
+
+
 async def _imp_run(path: str, people: dict, scan: dict) -> None:
     loop = asyncio.get_running_loop()
 
@@ -6167,7 +6719,8 @@ async def _imp_run(path: str, people: dict, scan: dict) -> None:
 
 
 async def api_import(req: web.Request) -> web.Response:
-    """GET: the folder that waits to be imported and how a running import goes. POST {op: scan, path}: what the folder holds;
+    """GET: the folder that waits to be imported and how a running import goes. POST {op: ls, path}: the folders in a folder of
+    this machine, for the page's folder picker; {op: scan, path}: what the folder holds;
     with src: "im" it is a folder of iMessage: {op: chats, path} lists its conversations, scan and run take one as `chat`;
     {op: run, path, people}: bring it in; {op: forget}: the waiting folder is not wanted. The owner only"""
     v = await need_viewer(req)
@@ -6194,6 +6747,11 @@ async def api_import(req: web.Request) -> web.Response:
     if op_ == "chats" and src == "im":                       # the conversations of a Messages folder: one of them is imported
         try:
             return web.json_response({"ok": True, **(await asyncio.to_thread(imimport.chats, path))})
+        except tgimport.Bad as x:
+            return web.json_response({"ok": False, "error": str(x)})
+    if op_ == "ls":                                          # the folder picker: a folder of this machine and what is in it
+        try:
+            return web.json_response({"ok": True, **(await asyncio.to_thread(_imp_ls, path, src))})
         except tgimport.Bad as x:
             return web.json_response({"ok": False, "error": str(x)})
     if op_ not in ("scan", "run"):
@@ -6467,6 +7025,10 @@ Exit code 2 of listen: say hello again, then listen. Exit code 3: the owner stop
 - To somebody: `lagomchat say --to <name> "..."`; to the owner: `--to owner`.
 - A question for the owner with buttons: `lagomchat ask "<question>" "<option 1>" "<option 2>"` instead of waiting for him in your terminal.
 - What you are doing now: `lagomchat working "<what>"`.
+- A picture, a screenshot, a short video or a PDF for the others to see: name the file in the message by its full path. The
+  command sends it and prints `sent <your path> -> <its path in the chat>`, and the page shows the picture itself; with no
+  such line the path stays a line of text that nobody can open. A file outside the folder you work in and the temp folders
+  is sent only with `lagomchat say --send ...`: say so only when you mean to show that very file.
 - Every message costs its readers a turn: no thanks, no "ok". `lagomchat help` has all the rules; read it once.
 """
 
@@ -6780,6 +7342,7 @@ def main():
     app.router.add_get("/api/pr/diff", api_pr_diff)
     app.router.add_get("/api/pr/file", api_pr_file)
     app.router.add_route("*", "/api/pr/comments", api_pr_comments)
+    app.router.add_route("*", "/api/pr/review", api_pr_review)
     app.router.add_route("*", "/api/chats", api_chats)
     app.router.add_get("/api/chaticons", api_chaticons)
     app.router.add_get("/api/chatnew", api_chatnew)

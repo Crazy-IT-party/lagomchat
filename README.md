@@ -293,4 +293,4 @@ Apache License 2.0, see `LICENSE`. Made by the Lagom studio (lagom.game); a redi
 ## Credits
 
 martyshka, Luca, Dominic, Patrick, ovtza, penis lena, moon, ienrf, HACTEHA, pio, Fedor, mama, Masha, Natasha, Tsoi, Gorshok, Eugene, Jim,
-Alexander, Adam, pupsique, Zello, Thomas, Sina, Scooby, elkraino and LazyKarlson
+Alexander, Adam, pupsique, Zello, Thomas, Sina, Scooby, elkraino, LazyKarlson and Lysenko Viktor
