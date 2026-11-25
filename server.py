@@ -482,7 +482,7 @@ class Chat:
 
     def view(self, a: dict) -> dict:
         return {k: a[k] for k in ("name", "task", "text", "joined", "seen", "host", "cwd")} | {
-            "listening": bool(self.listeners.get(a["task"])), "working": a.get("working"), "waiting": a.get("waiting"), "turn_end": a.get("turn_end"), "status": a.get("status"),
+            "listening": bool(self.listeners.get(a["task"])), "working": a.get("working"), "waiting": a.get("waiting"), "turn_end": a.get("turn_end"), "status": a.get("status"), "prog": a.get("prog"),
             "stats": self.stats.get(a["task"]), "usage": a.get("usage"), "strikes": len(self.strikes.get("agent:" + a["task"], [])),
             "program": a.get("program"), "model": a.get("model"), "color": a.get("color"), "git": a.get("git"),
             "score": sum(self.scores().get(n, 0) for n in {a["name"], *a.get("was", [])}), "was": a.get("was", [])}
@@ -2062,8 +2062,8 @@ async def op(q: dict, ws) -> dict:
         s, err = status_clean(q.get("text"))
         if err:
             return {"ok": False, "error": {"emoji": "no emoji in a status", "too_long": f"{STATUS_MAX} characters at most"}[err]}
-        a["status"] = s or None
-        chat.meta.setdefault(task, {})["status"] = s or None
+        a["status"], a["prog"] = s or None, status_prog(a.get("prog"), s, int(time.time()))
+        chat.meta.setdefault(task, {}).update(status=a["status"], prog=a["prog"])
         chat.meta_file.write_text(json.dumps(chat.meta, ensure_ascii=False))
         await chat.watch_all({"type": "agents", "agents": chat.roster()})
         return {"ok": True, "status": s}
@@ -4362,8 +4362,7 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
             except (ValueError, TypeError, AttributeError):
                 continue
             # only the page of this very host may speak (not another site's page opened in the user's browser)
-            org = req.headers.get("Origin")
-            if org and urlparse(org).netloc != req.headers.get("Host"):
+            if _other_site(req):
                 await send(ws, json.dumps({"type": "error", "error": "wrong origin"}))
                 continue
             if q.get("confirm") is not None:                     # the owner's Confirm / Refuse on an agent's critical question (#3057)
@@ -4808,6 +4807,25 @@ def status_clean(raw) -> tuple[str, str]:
     s = "".join(c for c in s if unicodedata.category(c) not in ("Cc", "Cf") or c in "\n\t")      # no bidi overrides, no zero-width
     s = " ".join(s.split())
     return ("", "too_long") if len(s) > STATUS_MAX else (s, "")
+
+
+PROG_RE = re.compile(r"(.*?)\s*\[[#=\-. ]{2,}\]\s*(\d{1,3})\s*%", re.S)      # the page's ustHtml reads a bar the same way
+
+
+def status_prog(was: dict | None, s: str, now: int) -> dict | None:
+    """the times of a job shown as a bar in a status, for the time it has been going and the time left on the card (the owner,
+    #3670): when this job's bar came first (t0) and with what percent (p0), the percent now (p) and when it last grew (t), when
+    it ended (end: 100% or FAILED). The job is the text before the bar: another name or a lower percent starts anew"""
+    m = PROG_RE.match(s)
+    if not m:
+        return None
+    job, pc = m.group(1), min(100, int(m.group(2)))
+    if not was or was.get("job") != job or pc < was["p"]:
+        g = {"job": job, "t0": now, "p0": pc, "p": pc, "t": now}
+    else:
+        g = {**was, "p": pc, "t": now if pc > was["p"] else was["t"]}
+    g["end"] = (g.get("end") or now) if pc == 100 or re.search(r"\bFAILED\b", s) else None
+    return g
 
 
 # the chats' domains, one place for every chat on this machine, the server, chats.py and the page (the owner, 2026-11-08, #1981):
@@ -5627,8 +5645,7 @@ async def api_upload(req: web.Request):
     """POST a picture (the raw body, its Content-Type png/jpeg/gif/webp): saved under UPLOADS, {path} back - the page puts the
     path into the message, the agents read the file. Only the page of this very host may post."""
     v = await need_viewer(req)
-    org = req.headers.get("Origin")
-    if org and urlparse(org).netloc != req.headers.get("Host"):
+    if _other_site(req):
         raise web.HTTPForbidden()
     ext = UP_TYPES.get(req.headers.get("Content-Type", "").split(";")[0].strip().lower()) or \
         UP_EXT.get(Path(urllib.parse.unquote(req.headers.get("X-Filename", ""))).suffix.lower())
@@ -6941,8 +6958,7 @@ async def api_export(req: web.Request):
     if req.method == "POST":                              # the page sends its own markup of the log (#272)
         if req.content_length and req.content_length > 40 * 2 ** 20:
             raise web.HTTPRequestEntityTooLarge(max_size=40 * 2 ** 20, actual_size=req.content_length)
-        org = req.headers.get("Origin")
-        if org and urlparse(org).netloc != req.headers.get("Host"):
+        if _other_site(req):
             raise web.HTTPForbidden()
         q = await req.json()
         pdf, page = q.get("fmt") == "pdf", str(q.get("html") or "")
@@ -7030,6 +7046,26 @@ Exit code 2 of listen: say hello again, then listen. Exit code 3: the owner stop
   such line the path stays a line of text that nobody can open. A file outside the folder you work in and the temp folders
   is sent only with `lagomchat say --send ...`: say so only when you mean to show that very file.
 - Every message costs its readers a turn: no thanks, no "ok". `lagomchat help` has all the rules; read it once.
+
+## 6. The progress of a long job
+
+A build, a download, a test run of more than a few minutes: show how far it is on your card, so that nobody has to ask and no
+message is spent on it. Write it as `<name> [####------] <n>% <what now>` in your card's status; the page draws a bar of it:
+
+    lagomchat status "Build 55 [####------] 41% cooking 1120 of 1682"
+    lagomchat status                                    (alone: takes it off, when the job is dealt with)
+
+- 120 characters at most, no emoji. It stays until changed: your messages do not clear it (they clear `lagomchat working`).
+- Send it only when the line changed, every 10 seconds at most, from a script in the background that ends with the job.
+  One writer at a time: the last status wins. The session or the script ends: the bar stays as it was, so take it off.
+- The card shows by itself how long the job has been going and about how long is left, by the pace of the percent: keep
+  the name before the bar the same for the whole job (another name starts the clock anew) and do not write times yourself.
+- A count where there is one ("1120 of 1682"); a percent that is guessed is not a time left. 100% means that the job's
+  scripts have ended, not that the result is good; a failure says FAILED, and a message says why.
+- For example, with a command of yours, `my-progress`, that prints one line and is done when the line starts with "done":
+
+      last=""; while :; do line=$(my-progress); [ "$line" = "$last" ] || lagomchat status "$line"; last="$line"
+        case "$line" in done*) break;; esac; sleep 10; done
 """
 
 

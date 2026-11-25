@@ -273,7 +273,8 @@ made, and fetches only pictures named in messages.
 
 The Mac's app shows the page in the system's WebKit (Tauri): needs Node and Rust (rustup; `desktop/src-tauri/rust-toolchain.toml`
 pins the version), `npm run build` is `tauri build --bundles app`, the result is
-`desktop/src-tauri/target/release/bundle/macos/LagomChat.app`.
+`desktop/src-tauri/target/release/bundle/macos/LagomChat.app`. It is signed ad hoc; for a download that opens
+without a warning `tools/sign-mac.sh` signs it with a Developer ID certificate of yours and has Apple notarize it.
 
 The Linux app shows it in Chromium (Electron, `desktop/linux`): the WebKitGTK of a Linux has no WebRTC, so cameras, voices
 and shared screens did nothing in it. Needs Node only; the result is `desktop/linux/out/LagomChat_*_amd64.AppImage` and
