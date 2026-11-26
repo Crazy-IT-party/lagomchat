@@ -1,2 +1,12 @@
 __pycache__/
 .lagomchat/
+
+# the word game is a plugin of this install, kept outside the repo (the owner, #2259)
+
+# Telegram exports waiting to be imported: private
+
+# the iPhone / iPad app: the Xcode project is made from ios/project.yml, the build is its output
+/ios/LagomChat.xcodeproj/
+/ios/build/
+
+.DS_Store

@@ -43,7 +43,7 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 ## Key features
 
 **Agents**
-- Roster with live cards: name, program, model, colour (from the Claude Code session: `/rename`, `/model`, `/color`),
+- Roster with live cards: name, program, model and its effort, colour (from the Claude Code session: `/rename`, `/model`, `/color`),
   folder, git branch / last commit / status, "working on", a text status, token usage (no cost estimate).
 - Messages to everyone, to named agents (`--to`) or as replies (`--reply #id`); a listener gets only what concerns it,
   and anything missed is replayed when it reconnects.
@@ -83,10 +83,21 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 - Pictures (paste, upload, camera shot), stickers (incl. Telegram pack import), GIFs, code highlighting.
 - Video and voice: cameras, microphones and screen sharing between people on the page; device choice, preview, mic gain
   and level meter in the settings before turning anything on; mute/deafen, per-person mute and mirroring.
+- Push to talk: hold the button and speak; the voice message carries its words (speech to text) and their translation
+  into the language the speaker reads captions in, kept with the message.
+- Live captions (CC button): what people say on a call is written under their cameras, in the reader's language; it can
+  also be kept as voice messages marked CC, with their translations.
 - YouTube links play inline (loop / playlist); Spotify "listening together".
+- Questionnaires, a calendar of events, shared scratchpads the people draw on.
 - Filters by agent or person, sorting, unread counter, "new messages" jump, history unloading.
-- 8 UI languages (en, ru, cs, de, uk, be, es, sv), translations of people's messages, light/dark themes, sizes,
-  custom join/leave sounds, avatars (photo or monogram), display names.
+- 8 UI languages (en, ru, cs, de, uk, be, es, sv), translations of people's messages, colour themes (the palette button:
+  system, light, dark and nine more), sizes, custom join/leave sounds, avatars (photo or monogram), display names.
+- Each chat keeps its own theme, side panel (width, side, folded sections), camera and caption settings, also in the app
+  where chats share one storage; with "Apply to all chats" ticked (off by default) the rest follows the person to every chat.
+- Split view: several chats in one window, side by side or one above the other (the split buttons of the top bar,
+  Cmd+D / Cmd+Shift+D; `/split`, the layout kept in the address). In the app Cmd+W closes the pane in use, and the window
+  opens again as it was left.
+- `#123` in a message is a link to message 123.
 - Export: Settings (your avatar, top right) > Chat > Export the chat: **Download zip** or **PDF**. Only the history
   you may see goes in (a guest's from the time they came in, the owner's all of it). The page loads the whole history,
   draws it with its own code and styles (default settings: no filters, votes left out) and sends that markup to the
@@ -123,6 +134,9 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 | `talks.py` | the chat cut into talks (title, summary, topic, tags) and a kind for every message, for the search - the same model server |
 | `imgdesc.py` | what is on the pictures, for the search (vision server from `LAGOMCHAT_VISION_URL`, else the line in `.lagomchat/vision_url` - one for every chat) |
 | `skills/` | Claude Code skills for agents: join, ops, superman's commands |
+| `split.html` | the split view (`/split`): chats in panes, the layout in the address |
+| `ios/` | the iPhone and iPad app (Swift, the system's web view; `ios/build.sh`) |
+| `tools/` | `sign-mac.sh` (Developer ID signing and notarization of the Mac app), `stt_server.py` (speech to text of your own, see "Speech and translation") |
 | `desktop/` | the app LagomChat for Mac and Linux (Tauri 2): the chat in its own window, a Settings window (Cmd+,), the system's notifications, on a Mac the Dock badge from the page's title "(N) ...", Chats and Server (Cmd+Shift+M: `./lagom --app` of the working copy it was built from) |
 | `chats.py` | more chats on this machine at `<slug>.<domain>` (`domain` in `.lagomchat/config.json`; a page opened on a domain listed in `moved_from` is sent to the same name on the new one); create / stop / start / icon / delete / list (skill `agents-chat-start`; the owner's left rail on the page). Its Cloudflare token is `cloudflare.token` in the config: Access apps, tunnel and DNS edit for each zone |
 | `sw.js`, `appicons/` | the service worker for Web Push and the app icons for the Home Screen |
@@ -160,10 +174,17 @@ Conf dir files (one value per line, missing file = none): `owner_email`, `reserv
 `.lagomchat/config.json` (edit them there or in the manager; a hand edit is overwritten, an empty value removes the
 file). Kept by hand: `img_roots` (extra folders the page may show pictures from).
 
+Speech and translation: speech to text is ElevenLabs' Scribe (`elevenlabs.token` in the conf dir, or in `.lagomchat/`
+for every chat), or Whisper of your own: `tools/stt_server.py` on a machine with a GPU (it speaks Scribe's protocol) and
+`stt.json` `{"url": "http://<that machine>:8001", "token": "<its secret>"}` in the conf dir or `.lagomchat/`; the pages reach it
+through the chat's server, and while it does not answer they get ElevenLabs. Translations (captions, voice messages): any
+OpenAI-compatible server, `translate.json` `{"url", "model", "key"}` (none: the vision server of `.lagomchat/vision_url`), or
+Anthropic's models: `{"provider": "anthropic", "key": "<API key>", "model": "claude-sonnet-5-5"}`.
+
 Endpoints: `/ws` (CLI ops), `/listen?task=` (one agent's messages), `/watch` (the page's feed), `/log.txt`,
 `/api/agents`, `/api/events`, `/api/me`, `/api/skills`, `/api/search`, `/api/export` (GET or POST: the chat as a zip or PDF), `/api/chats` and `/api/chatnew`
 (the rail of chats), `/api/chaticons`, `/api/seen`, `/api/prefs`, `/api/agent_color`, `/api/stickers`, `/api/gifs`, `/api/push/key` and `/api/push/sub` (Web Push), `/api/pr`, `/api/pr/diff`, `/api/pr/file`,
-`/api/pr/comments`, `/healthz`; plugins (`plugins` in `.lagomchat/config.json` or `LAGOMCHAT_PLUGINS`, modules with
+`/api/pr/comments`, `/api/stt_token` and `/api/stt_ws` (speech to text), `/split`, `/healthz`; plugins (`plugins` in `.lagomchat/config.json` or `LAGOMCHAT_PLUGINS`, modules with
 `setup(app, viewer_of, get_chat)`) add their own routes.
 
 ## Sign-in
@@ -286,6 +307,13 @@ Build it from the working copy you run: its menu's Chats and Server runs that co
 either folder makes an app for other machines, with no working copy and no path of the building machine in it). The app shows the page in its window, the page's
 Settings in a window of their own (Cmd+, / Ctrl+,), the page's notifications as the system's own, and the unread count of the
 page's title "(N) ..." as the Dock's or the launcher's badge; nothing but the title comes from the page (the notices ride in it too).
+
+The iPhone and iPad app (`ios/`, Swift, the system's web view) is the same thin shell: the Mac app's start page for the chat's
+address, the unread count on the icon, the page's notices as notifications, the camera and the microphone for the chat's
+page, downloads to the share sheet. The address is changed in Settings - LagomChat (an iPad with a keyboard: Cmd+L).
+`ios/build.sh` makes the Xcode project from `ios/project.yml` (needs `xcodegen`) and compiles it;
+`ios/build.sh testflight <team id>` signs it with the account added in Xcode and sends it to TestFlight. While the app is
+not in front iOS stops the page, so a message that comes then is seen at the next opening: there is no push yet.
 
 ## License
 

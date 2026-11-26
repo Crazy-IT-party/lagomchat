@@ -32,7 +32,8 @@
                          tool runner only returns a command's output after that command exits
     agentchat status "<text>"    a text status on your card, until you change it: 120 characters, no emoji; "agentchat status" alone clears it
     agentchat working "<what>"   a few words on what you are doing now: the owner's page shows it on your card; your next
-                         message or bye clears it ("agentchat working" alone clears it too)
+                         message or bye clears it - a Claude Code session's stays through its turn, till the turn ends
+                         after a message of it ("agentchat working" alone clears it too)
     agentchat skills [--add "name=what it does" ...]   send your skills / commands again (hello sends them from your skill
                          folders and your plugins, as <plugin>:<name>; --add the built-in ones the files do not show): the owner's page lists them when he types /
     agentchat confirm "<what exactly will be done>"   a critical action: the owner's page shows Confirm / Refuse (15 minutes). The
@@ -187,7 +188,8 @@ def frame(e: dict) -> str:
     c = e.get("confirmed")
     cf = (f'\n[the pick on your confirm question #{c.get("id")}: {"YES" if c.get("ok") is True else "NO"}; before you act: agentchat confirmed {c.get("id")}]'
           if isinstance(c, dict) else "")
-    return f'{who}{to}: {quote}{e["text"]}{doc}{cf}'
+    pad = "\n[a scratchpad: the people draw on it on the page]" if e.get("pad") else ""
+    return f'{who}{to}: {quote}{e["text"]}{doc}{cf}{pad}'
 
 
 def _stat(pid: int) -> list[str] | None:
@@ -323,6 +325,9 @@ NOUN = ["walrus", "pelmen", "capybara", "teapot", "hedgehog", "potato", "borscht
 HUES = list(range(0, 360, 10))                               # a made-up colour: one of 36 hues
 
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")          # Claude Code's effort levels
+
+
 def session_meta(sid: str) -> dict | None:
     """{title, color, model} of the Claude Code session `sid` as its transcript has them now ('' when not set), or None when
     it is not a Claude Code session on this machine; incremental like claude_usage: only what was appended is read again"""
@@ -331,26 +336,43 @@ def session_meta(sid: str) -> dict | None:
     if not files:
         return None
     path = max(files, key=os.path.getmtime)
-    st = META_STATE.setdefault(path, {"off": 0, "title": "", "color": "", "model": "", "turn": 0.0})
+    st = META_STATE.setdefault(path, {"off": 0, "title": "", "color": "", "model": "", "effort": "", "turn": 0.0, "busy": 0.0})
     try:
         size = os.path.getsize(path)
         if size < st["off"]:
-            st.update(off=0, title="", color="", model="", turn=0.0)
+            st.update(off=0, title="", color="", model="", effort="", turn=0.0, busy=0.0)
         with open(path, "rb") as f:
             f.seek(st["off"])
             data = f.read(size - st["off"])
     except OSError:
-        return {k: st[k] for k in ("title", "color", "model", "turn")}
+        return {k: st[k] for k in ("title", "color", "model", "effort", "turn", "busy")}
     end = data.rfind(b"\n") + 1                       # only whole lines: a half written one is read next time
     st["off"] += end
     for ln in data[:end].splitlines():
-        if not (b'"custom-title"' in ln or b'"agent-color"' in ln or (b'"assistant"' in ln and b'"model"' in ln) or b"Set model to" in ln):
+        if not (b'"custom-title"' in ln or b'"agent-color"' in ln or b'"assistant"' in ln or b'"user"' in ln):
             continue
         try:
             e = json.loads(ln)
         except ValueError:
             continue
         t = e.get("type")
+        # the session at work (the owner, #3728: the card said idle while the console showed it busy): from the first line of a
+        # turn - a prompt, a tool's result, an answer that goes on - till its end_turn or the user's Esc
+        if t in ("user", "assistant") and not e.get("isSidechain") and isinstance(e.get("message"), dict):
+            try:
+                at = datetime.fromisoformat(str(e.get("timestamp")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                at = time.time()
+            c = e["message"].get("content")
+            # a local command (/effort, /model, /color, /rename) writes lines of its own with no answer after them: no turn (audit)
+            local = e.get("isMeta") or (isinstance(c, str) and c.lstrip().startswith(("<command-name>", "<local-command-stdout>", "<local-command-caveat>")))
+            stop = "[Request interrupted by user" in (c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)[:400])
+            if t == "assistant" and e["message"].get("stop_reason") == "end_turn" or stop:
+                st["busy"] = 0.0
+                if stop:
+                    st["turn"] = at
+            elif not st["busy"] and not local:
+                st["busy"] = at
         if t == "custom-title":
             st["title"] = str(e.get("customTitle") or "").strip()
         elif t == "agent-color":
@@ -359,6 +381,8 @@ def session_meta(sid: str) -> dict | None:
             m = str(e["message"].get("model") or "")
             if m.startswith("claude-"):                     # not "<synthetic>"
                 st["model"] = m
+            if str(e.get("effort") or "") in EFFORTS:       # the session's effort (the owner, #3809)
+                st["effort"] = e["effort"]
             if e["message"].get("stop_reason") == "end_turn":   # the session finished its turn (the owner, #1744)
                 try:
                     st["turn"] = datetime.fromisoformat(str(e.get("timestamp")).replace("Z", "+00:00")).timestamp()
@@ -370,7 +394,16 @@ def session_meta(sid: str) -> dict | None:
             x = re.match(r"<local-command-stdout>(?:\x1b\[[0-9;]*m)*Set model to (?:\x1b\[[0-9;]*m)*`?([^`\x1b\n<]+?)(?: \(.*?\))?`?(?:\x1b\[[0-9;]*m)*(?: and saved.*| for this session.*)?</local-command-stdout>", c) if isinstance(c, str) else None
             if x:
                 st["model"] = x.group(1).strip()            # "Opus 5.5": model_name() leaves it as it is
-    return {k: st[k] for k in ("title", "color", "model", "turn")}
+            x = re.search(r"Set effort level to (\w+)", c) if isinstance(c, str) and "<local-command-stdout>" in c else None
+            if x and x.group(1) in EFFORTS:                 # /effort: the card follows at once
+                st["effort"] = x.group(1)
+    # a session that wrote nothing for 30 minutes is not at work, whatever its last line was (killed, or waiting for a dialog)
+    try:
+        if st["busy"] and time.time() - os.path.getmtime(path) > 1800:
+            st["busy"] = 0.0
+    except OSError:
+        pass
+    return {k: st[k] for k in ("title", "color", "model", "effort", "turn", "busy")}
 
 
 def claude_title(sid: str) -> str:
@@ -915,7 +948,7 @@ def hello(name: str, text: str, wait: float, program: str = "", model: str = "")
                              f"agentchat command LAGOMCHAT_TASK=<a code of your own>. Renaming yourself: bye, then hello.")
         early: list = []
         hi = {"op": "hello", "task": task, "text": text, "pid": pid, "start": proc_start(pid), "host": os.environ.get("LAGOMCHAT_HOSTNAME") or socket.gethostname(),
-              "cwd": os.getcwd(), "program": program or ("Claude Code" if session else guess_program()), "model": model,
+              "cwd": os.getcwd(), "program": program or ("Claude Code" if session else guess_program()), "model": model, "effort": meta.get("effort", ""),
               "color": color_for(task, meta.get("color", ""))}
         tries = candidates(name, task) if name.lower() != "superman" else [name]
         for n in tries:
@@ -1294,7 +1327,7 @@ def main() -> None:
         def follow_name() -> None:
             # the session renamed (/rename), another model (/model), another colour (/color): the chat follows within seconds
             sid, seen, sent = os.environ.get("CLAUDE_CODE_SESSION_ID", ""), None, None
-            told_turn = 0.0
+            told_turn, told_busy = 0.0, None
             try:                              # the name last given: only a change from it is a /rename to follow
                 seen = title_file(task).read_text()
             except OSError:
@@ -1305,7 +1338,7 @@ def main() -> None:
                     m = session_meta(sid)
                     if m is None:
                         return
-                    t, want = m["title"], {"model": model_name(m["model"]), "color": color_for(task, m["color"])}
+                    t, want = m["title"], {"model": model_name(m["model"]), "color": color_for(task, m["color"]), "effort": m.get("effort", "")}
                     if TOKEN and want != sent:
                         # a token's agent: the server knows it by the token's task, not this session's, so it is not found
                         # by its task below and its card kept the model of its hello (the owner #221); its name is the token's
@@ -1321,7 +1354,8 @@ def main() -> None:
                                         title_file(task).write_text(t)
                                     except OSError:
                                         pass
-                            if me and (me.get("model") != want["model"] and want["model"] or me.get("color") != want["color"]):
+                            if me and (me.get("model") != want["model"] and want["model"] or me.get("color") != want["color"]
+                                       or want["effort"] and me.get("effort") != want["effort"]):
                                 call(ws, {"op": "meta", "task": task, **{k: v for k, v in want.items() if v}})
                         seen, sent = t or seen, want
                     if m["turn"] and m["turn"] != told_turn:
@@ -1329,6 +1363,12 @@ def main() -> None:
                         with connect() as ws:
                             call(ws, {"op": "turn", "task": task, "ago": max(0.0, time.time() - m["turn"])})
                         told_turn = m["turn"]
+                    busy = bool(m["busy"])
+                    if busy != told_busy:
+                        # the turn started (or ended without an end_turn: Esc, a silent half hour): the card shows it at work
+                        with connect() as ws:
+                            call(ws, {"op": "turn", "task": task, "busy": busy, "ago": max(0.0, time.time() - (m["busy"] or time.time()))})
+                        told_busy = busy
                 except BaseException:
                     pass
                 time.sleep(5)
@@ -1555,7 +1595,7 @@ def main() -> None:
             m = session_meta(sid) or {}
             if m.get("model"):
                 with connect() as ws:
-                    call(ws, {"op": "meta", "task": task, "model": model_name(m["model"]), "color": color_for(task, m.get("color", ""))})
+                    call(ws, {"op": "meta", "task": task, "model": model_name(m["model"]), "color": color_for(task, m.get("color", "")), "effort": m.get("effort", "")})
                 return
             time.sleep(3)
     elif cmd == "wait":

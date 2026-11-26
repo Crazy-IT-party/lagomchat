@@ -1,0 +1,28 @@
+# LagomChat for iPhone and iPad: the Xcode project is made from this file (`xcodegen generate`, or ./build.sh), not kept.
+# The version comes from the Mac app's tauri.conf.json and the team from the one who builds: ./build.sh gives both.
+name: LagomChat
+options:
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+targets:
+  LagomChat:
+    type: application
+    platform: iOS
+    sources:
+      - path: LagomChat
+      # the start page where the chat's address is entered: the Mac app's own, one file for both
+      - path: ../desktop/dist/index.html
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: game.lagom.chat
+        PRODUCT_NAME: LagomChat
+        INFOPLIST_FILE: LagomChat/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "0.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic

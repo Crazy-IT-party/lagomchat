@@ -216,6 +216,13 @@ class Chat:
             self.polls: dict = {int(k): v for k, v in json.loads(self.polls_file.read_text()).items()}
         except (OSError, ValueError):
             self.polls = {}
+        # scratchpads (the owner, #3741): a message with a canvas the people draw on together - {message id: [stroke]}, a stroke
+        # {"k": the key its page gave it, "n": who drew it, "c": "#rrggbb", "w": its width in thousandths of the canvas's width,
+        # "p": [x, y, x, y, ...] in 0..10000 of the canvas}; a file each in pads/, read when first asked for, written a moment
+        # after the drawing stops
+        self.pad_dir = DATA / "pads"
+        self.pads: dict = {}
+        self.pad_dirty: set = set()
         self.reacts_file = DATA / "reacts.json"
         try:
             self.reacts: dict = {int(k): v for k, v in json.loads(self.reacts_file.read_text()).items()}
@@ -451,7 +458,7 @@ class Chat:
             self.people_on.pop(t, None)
         if e["kind"] == "hello":
             self.agents[t] = {"name": e["agent"], "task": t, "text": e["text"], "joined": e["ts"], "seen": e["ts"],
-                              "since": e["id"], **{k: e.get(k) for k in ("pid", "start", "host", "cwd", "program", "model", "color")}}
+                              "since": e["id"], **{k: e.get(k) for k in ("pid", "start", "host", "cwd", "program", "model", "effort", "color")}}
             self.agents[t].update(self.meta.get(t, {}))
         elif e["kind"] == "rename" and t in self.agents:
             # the session was renamed (Claude Code's /rename): the agent goes on under the new name, the old ones kept -
@@ -482,9 +489,9 @@ class Chat:
 
     def view(self, a: dict) -> dict:
         return {k: a[k] for k in ("name", "task", "text", "joined", "seen", "host", "cwd")} | {
-            "listening": bool(self.listeners.get(a["task"])), "working": a.get("working"), "waiting": a.get("waiting"), "turn_end": a.get("turn_end"), "status": a.get("status"), "prog": a.get("prog"),
+            "listening": bool(self.listeners.get(a["task"])), "working": a.get("working"), "waiting": a.get("waiting"), "turn_end": a.get("turn_end"), "busy": a.get("busy"), "status": a.get("status"), "prog": a.get("prog"),
             "stats": self.stats.get(a["task"]), "usage": a.get("usage"), "strikes": len(self.strikes.get("agent:" + a["task"], [])),
-            "program": a.get("program"), "model": a.get("model"), "color": a.get("color"), "git": a.get("git"),
+            "program": a.get("program"), "model": a.get("model"), "effort": a.get("effort"), "color": a.get("color"), "git": a.get("git"),
             "score": sum(self.scores().get(n, 0) for n in {a["name"], *a.get("was", [])}), "was": a.get("was", [])}
 
     def roster(self) -> list[dict]:
@@ -732,6 +739,8 @@ class Chat:
             v = self.view_for(e, start, "verified")                  # what they see: not the quoted start of an earlier message
             if v:
                 out.update(MEDIA_PATH_RE.findall(v.get("text") or ""))
+                if e.get("pad"):                                     # the pictures put on a scratchpad (#3751)
+                    out.update(o["src"] for o in self.pad_of(e["id"])["o"] if o.get("src"))
         return out
 
     def take_in(self, evs: list[dict], reacts: dict) -> int:
@@ -815,6 +824,195 @@ class Chat:
             return {"v": v}
         n = len((e.get("poll") or {}).get("o") or [])
         return {"c": [sum(i in p for p in v.values()) for i in range(n)], "n": len(v), "me": v.get(who, [])}
+
+    def pad_of(self, mid: int) -> dict:
+        """the scratchpad `mid` (read from its file the first time): its strokes `s` and its objects `o` - the pictures and
+        shapes put on it (#3751), each moved, turned and sized as a whole. A file of the first days holds only the strokes"""
+        if mid not in self.pads:
+            try:
+                d = json.loads((self.pad_dir / f"{mid}.json").read_text())
+            except (OSError, ValueError):
+                d = None
+            if isinstance(d, list):
+                d = {"s": d, "o": []}
+            self.pads[mid] = d if isinstance(d, dict) and isinstance(d.get("s"), list) and isinstance(d.get("o"), list) else {"s": [], "o": []}
+        return self.pads[mid]
+
+    async def pad_save_later(self) -> None:
+        await asyncio.sleep(2)
+        self.pad_dir.mkdir(exist_ok=True)
+        for mid in list(self.pad_dirty):
+            self.pad_dirty.discard(mid)
+            if mid not in self.pads:                      # dropped with its message meanwhile
+                continue
+            tmp = self.pad_dir / f"{mid}.json.tmp"
+            try:
+                tmp.write_text(json.dumps(self.pads[mid], separators=(",", ":")))
+                tmp.replace(self.pad_dir / f"{mid}.json")
+            except OSError as x:                          # a full disk: tried again later, not given up on (audit)
+                print(f"[pad] {mid} not saved: {x}", flush=True)
+                self.pad_dirty.add(mid)                   # not empty now: pad_changed waits for this retry
+                asyncio.get_running_loop().call_later(30, lambda: asyncio.ensure_future(self.pad_save_later()))
+                return
+
+    def pad_drop(self, ids) -> None:
+        """the scratchpads of messages deleted or purged go with them, from the memory and the disk"""
+        for i in ids:
+            self.pads.pop(i, None)
+            self.pad_dirty.discard(i)
+            with contextlib.suppress(OSError):
+                (self.pad_dir / f"{i}.json").unlink()
+
+    def pad_changed(self, mid: int) -> None:
+        if not self.pad_dirty:
+            asyncio.ensure_future(self.pad_save_later())
+        self.pad_dirty.add(mid)
+
+    async def pad_draw(self, d: dict, me: dict, start: int) -> str | None:
+        """a page's piece of drawing on a scratchpad (#3741): points added to its stroke (a new key starts one; `e` = an eraser's), or its own last
+        stroke taken back (undo), or the whole pad wiped (clear: its author or the owner); every page that sees the message
+        gets the change at once"""
+        mid = _int(d.get("id"))
+        e = next((x for x in self.events if x["id"] == mid), None)
+        if not e or not e.get("pad") or mid in self.deleted or not self.sees(mid, start):
+            return "no such scratchpad"
+        name, pad = me["name"], self.pad_of(mid)
+        s = pad["s"]
+        if d.get("clear"):
+            if me["role"] != "owner" and e.get("agent") != name:
+                return "only who made the scratchpad, or the owner, wipes it"
+            s.clear()
+            pad["o"].clear()
+            self.pad_changed(mid)
+            await self.tell_seers(mid, {"type": "pad", "id": mid, "clear": 1, "n": name})
+            return None
+        if "obj" in d or "del" in d:
+            return await self.pad_obj(mid, d, name, pad["o"])
+        if isinstance(d.get("objs"), list):                 # several picked ones moved or recoloured together (#3758)
+            for q in d["objs"][:200]:
+                if bad := await self.pad_obj(mid, {"obj": q}, name, pad["o"]):
+                    return bad
+            return None
+        if isinstance(d.get("sp"), list):                   # drawn lines picked and moved / turned / sized / recoloured (#3769)
+            for q in d["sp"][:500]:
+                if bad := await self.pad_line(mid, q, name, s):
+                    return bad
+            return None
+        if isinstance(d.get("sdel"), dict):                 # a picked drawn line taken off, whoever drew it
+            k, n = str(d["sdel"].get("k")), str(d["sdel"].get("n"))
+            i = next((i for i, x in enumerate(s) if x["k"] == k and x["n"] == n), None)
+            if i is not None:
+                s.pop(i)
+                self.pad_changed(mid)
+                await self.tell_seers(mid, {"type": "pad", "id": mid, "undo": k, "n": n})
+            return None
+        if d.get("undo"):
+            i = next((i for i in range(len(s) - 1, -1, -1) if s[i]["n"] == name), None)
+            if i is not None:
+                k = s.pop(i)["k"]
+                self.pad_changed(mid)
+                await self.tell_seers(mid, {"type": "pad", "id": mid, "undo": k, "n": name})
+            return None
+        k, c, p = str(d.get("k") or "")[:40], str(d.get("c") or ""), d.get("p")
+        if not k or not re.fullmatch(r"#[0-9a-fA-F]{6}", c) or not isinstance(p, list) or not p or len(p) % 2 or len(p) > 800:
+            return "a stroke: k, c (#rrggbb), p (x, y, ... in 0..10000)"
+        try:
+            p = [max(0, min(10000, int(v))) for v in p]
+            w = max(1, min(40, int(d.get("w") or 5)))
+        except (TypeError, ValueError, OverflowError):
+            return "bad points"
+        st = next((x for x in reversed(s[-60:]) if x["k"] == k and x["n"] == name), None)
+        if st is None:
+            if len(s) >= 5000:
+                return "the scratchpad is full: wipe it, or start another"
+            st = {"k": k, "n": name, "c": c.lower(), "w": w, "p": []}
+            if d.get("e"):
+                st["e"] = 1                               # the eraser (#3749): the stroke wipes what is under it
+            s.append(st)
+        if len(st["p"]) + len(p) > 20000:
+            return "the stroke is too long"
+        st["p"] += p
+        self.pad_changed(mid)
+        await self.tell_seers(mid, {"type": "pad", "id": mid, "k": k, "n": name, "c": st["c"], "w": st["w"], "e": st.get("e", 0), "p": p})
+        return None
+
+    PAD_SHAPES = ("img", "rect", "ellipse", "line", "arrow", "text")
+
+    async def pad_line(self, mid: int, q, name: str, s: list) -> str | None:
+        """a drawn line of a scratchpad changed as a whole (#3769): its points `p` all anew (moved, turned or sized on a page; they
+        may lie off the pad), its colour `c` or width `w`. Anybody who draws may; one gone meanwhile is let be"""
+        if not isinstance(q, dict):
+            return "sp: [{k, n, p, c, w}]"
+        k, n = str(q.get("k") or ""), str(q.get("n") or "")
+        st = next((x for x in s if x["k"] == k and x["n"] == n and not x.get("e")), None)
+        if st is None:
+            return None
+        out = {"k": k, "n": n}
+        try:
+            if q.get("p") is not None:
+                p = q["p"]
+                if not isinstance(p, list) or not p or len(p) % 2 or len(p) > 20000:
+                    return "sp: p (x, y, ...)"
+                st["p"] = out["p"] = [max(-5000, min(15000, int(v))) for v in p]
+            if q.get("w") is not None:
+                st["w"] = out["w"] = max(1, min(40, int(q["w"])))
+        except (TypeError, ValueError, OverflowError):
+            return "bad numbers"
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", str(q.get("c") or "")):
+            st["c"] = out["c"] = q["c"].lower()
+        self.pad_changed(mid)
+        await self.tell_seers(mid, {"type": "pad", "id": mid, "sp": out, "n": name})
+        return None
+
+    async def pad_obj(self, mid: int, d: dict, name: str, objs: list) -> str | None:
+        """a picture, a shape or a text on a scratchpad (#3751, #3758): put on (a new key, with its kind `t`; a picture names an
+        uploaded file in `src`, a text holds its words in `s`), moved / turned / sized / recoloured / a text rewritten (the same
+        key: x, y, w, h, r, c, sw, s - its kind and picture stay), or taken off (`del`). A text is `w` wide, its letters `h` high.
+        Anybody who draws may move what is there. x, y: its centre, 0..10000 of the pad's width and height; w, h: its size in
+        10000ths of the width; r: degrees"""
+        if "del" in d:
+            k = str(d.get("del"))
+            if any(o["k"] == k for o in objs):
+                objs[:] = [o for o in objs if o["k"] != k]
+                self.pad_changed(mid)
+                await self.tell_seers(mid, {"type": "pad", "id": mid, "del": k, "n": name})
+            return None
+        q = d.get("obj")
+        if not isinstance(q, dict):
+            return "obj: {k, t, x, y, w, h, r, c, sw, src}"
+        k = str(q.get("k") or "")[:40]
+        o = next((x for x in objs if x["k"] == k), None)
+        if not k:
+            return "obj: k"
+        try:
+            nums = {f: max(lo, min(hi, int(q[f]))) for f, lo, hi in
+                    (("x", -5000, 15000), ("y", -5000, 15000), ("w", 0, 20000), ("h", 0, 20000), ("sw", 1, 40)) if q.get(f) is not None}
+            if q.get("r") is not None:
+                nums["r"] = round(max(-360.0, min(360.0, float(q["r"]))), 1)   # (a NaN comes out as 360: a number, not a crash)
+        except (TypeError, ValueError, OverflowError):
+            return "bad numbers"
+        if o is None:
+            t, c, src = q.get("t"), str(q.get("c") or "#222222"), str(q.get("src") or "")
+            if t not in self.PAD_SHAPES or not re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+                return f"obj: t one of {', '.join(self.PAD_SHAPES)}, c #rrggbb"
+            if t == "img":
+                p = Path(src[:400])
+                if not (p.parent == UPLOADS and p.suffix.lower() in IMG_TYPES and p.is_file()):
+                    return "obj: src, a picture uploaded to this chat"
+            if len(objs) >= 200:
+                return "the scratchpad has 200 pictures and shapes: take some off"
+            o = {"k": k, "n": name, "t": t, "c": c.lower(), "x": 5000, "y": 5000, "w": 3000, "h": 3000, "r": 0.0, "sw": 5}
+            if t == "img":
+                o["src"] = str(p)
+            objs.append(o)
+        if o["t"] == "text" and q.get("s") is not None:
+            o["s"] = str(q["s"])[:500]
+        o.update(nums)
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", str(q.get("c") or "")):   # a shape's colour changed (a new one has it already)
+            o["c"] = q["c"].lower()
+        self.pad_changed(mid)
+        await self.tell_seers(mid, {"type": "pad", "id": mid, "obj": o, "n": name})
+        return None
 
     async def thumbs_set(self, mid: int, who: str, d: int) -> None:
         """the thumbs of `who` as their vote says: the one of d on, the others off (the owner, #1974); a skin tone counts as its thumb"""
@@ -1090,6 +1288,7 @@ class Chat:
             await self.to_mongo({"id": mid, "set": {"deleted": {"by": RATER, "ts": now}}, "insert": {"message": msg, "agent": agent}})
         await self.watch_all({"type": "del", "id": mid})
         self.cctr_drop({mid})
+        self.pad_drop({mid})
         if e["kind"] == "msg":
             await self.talks_forget({mid})
         print(f"[del] #{mid} ({e['kind']} of {e.get('agent')})", flush=True)
@@ -1155,6 +1354,7 @@ class Chat:
             for p in self.pics.pop(i, ()):
                 self.pic_ids.get(p, set()).discard(i)
         self.cctr_drop(ids)
+        self.pad_drop(ids)
         await self.watch_all({"type": "purged", "ids": sorted(ids), "first": self.events[0]["id"] if self.events else 0})
         if any(p["id"] in ids for p in self.pins):
             self.pins = [p for p in self.pins if p["id"] not in ids]
@@ -1248,7 +1448,11 @@ class Chat:
         with self.txt.open("a") as f:
             f.write(line(e) + "\n")
         a2 = self.agents.get(a["task"])
-        cleared = bool(a2 and kind in ("msg", "bye") and a2.pop("working", None))
+        # a Claude Code session at work keeps its "working" through its progress notes: the end of its turn clears it (#3728)
+        mid = bool(a2 and kind == "msg" and a2.get("busy") and self.listeners.get(a["task"]))
+        if mid:
+            a2["said"] = True
+        cleared = bool(a2 and not mid and kind in ("msg", "bye") and a2.pop("working", None))
         await self.fanout(e)
         if kind in ("msg", "remind") and PUSH.subs and not e.get("cc"):
             asyncio.create_task(push_out(self, e))           # Web Push to the people whose pages are closed (the owner, #1445)
@@ -1577,6 +1781,9 @@ CC_HUE = {"red": 0, "orange": 28, "yellow": 48, "green": 130, "cyan": 185, "blue
 COLORS = {"red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink"}     # Claude Code's /color
 
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")          # a session's effort, shown on its card (the owner, #3809)
+
+
 def color_of(c) -> str | None:
     """an agent's colour: one of Claude Code's /color names, or 'h<hue 0-359>' (a session without one: made up), else None"""
     c = str(c or "").strip().lower()
@@ -1643,6 +1850,7 @@ async def op(q: dict, ws) -> dict:
             chat.meta_file.write_text(json.dumps(chat.meta, ensure_ascii=False))
         await chat.post("hello", a, text, **{k: (str(q[k])[:60] if k in ("program", "model") and q.get(k) else q.get(k))
                                               for k in ("pid", "start", "host", "cwd", "program", "model")},
+                        effort=q.get("effort") if q.get("effort") in EFFORTS else None,
                         color=color_of(q.get("color")))
         chat.clients.setdefault(task, set()).add(ws)
         chat.delivered[task] = chat.next_id - 1
@@ -1873,10 +2081,20 @@ async def op(q: dict, ws) -> dict:
     if kind == "turn":
         # the session finished a turn (its listener saw it in the transcript): it may stay silent on purpose - praise needs no
         # answer - so the page stops showing "answering" for what it got before this (the owner, #1744)
+        # With "busy" (#3728): true - a turn started that long ago, the card shows the session at work till it ends; false - it
+        # ended. A turn that ended after a message of it takes its "working" along (its messages in the turn did not)
         try:
-            a["turn_end"] = round(time.time() - max(0.0, float(q.get("ago") or 0)), 3)
+            at = round(time.time() - max(0.0, float(q.get("ago") or 0)), 3)
         except (TypeError, ValueError):
             return {"ok": False, "error": "bad ago"}
+        if q.get("busy") is True:
+            a["busy"] = at
+        else:
+            if "busy" not in q:
+                a["turn_end"] = at
+            a.pop("busy", None)
+            if a.pop("said", None):
+                a.pop("working", None)
         await chat.watch_all({"type": "agents", "agents": chat.roster()})
         return {"ok": True}
     if kind == "meta":
@@ -1884,6 +2102,8 @@ async def op(q: dict, ws) -> dict:
         m = {}
         if q.get("model"):
             m["model"] = str(q["model"])[:60]
+        if q.get("effort") in EFFORTS:                  # the session's effort (the owner, #3809)
+            m["effort"] = q["effort"]
         if "color" in q:
             m["color"] = color_of(q.get("color"))
         if m and any(a.get(k) != v for k, v in m.items()):
@@ -2068,7 +2288,8 @@ async def op(q: dict, ws) -> dict:
         await chat.watch_all({"type": "agents", "agents": chat.roster()})
         return {"ok": True, "status": s}
     if kind == "working":
-        # what the agent is on now, short: the page shows it on the agent's card; its next message or bye clears it
+        # what the agent is on now, short: the page shows it on the agent's card; its next message or bye clears it (a Claude Code
+        # session's: the end of the turn in which it said something, #3728)
         w = text.strip()[:120]
         if w:
             a["working"] = {"text": w, "since": round(time.time(), 3)}
@@ -4139,7 +4360,11 @@ _stt_last: dict[str, float] = {}
 # a person may say they speak and may read captions in. The translating is done by a model server of our own, an OpenAI-compatible
 # /v1/chat/completions: translate.json {"url": ..., "model": ..., "key": ..., "extra": {...}} in the chat's config folder or in
 # .lagomchat of the working copy; with none, the address in vision_url (the model that describes the pictures). What people say
-# goes nowhere else unless the owner puts another address there
+# goes nowhere else unless the owner puts another address there.
+# Anthropic's models (the owner, #3822): translate.json {"provider": "anthropic", "key": "<API key>", "model": "claude-sonnet-5-5",
+# "effort": "low"} - the Messages API; "key" may be left out when the chat's process has ANTHROPIC_API_KEY
+CLAUDE_URL = "https://api.anthropic.com"
+CLAUDE_FALLBACKS = ("claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5")   # models with the API's own fallback on a refusal
 CC_LANGS = {"en": "English", "de": "German", "ru": "Russian", "uk": "Ukrainian"}
 CC_VOICE_RE = re.compile(r"^(?:/[\w.\-]+)+\.(?:m4a|wav)[ \t]*\n\s*\S", re.I)
 
@@ -4163,14 +4388,40 @@ class Translator:
                     c = json.loads(f.read_text()) if f else {}
                 except (OSError, ValueError):
                     c = {}
-                if isinstance(c, dict) and c.get("url"):
+                if isinstance(c, dict) and (c.get("url") or c.get("provider") == "anthropic"):
                     break
                 c = {}
             self._c = c
-        return self._c if self._c.get("url") else {"url": self.fallback()}
+        return self._c if self._c else {"url": self.fallback()}
 
     def ready(self) -> bool:
-        return bool(self.conf().get("url"))
+        c = self.conf()
+        return bool(c.get("url") or c.get("provider") == "anthropic" and (c.get("key") or os.environ.get("ANTHROPIC_API_KEY")))
+
+    async def _claude(self, cs: ClientSession, c: dict, system: str, text: str) -> str:
+        """the translation by an Anthropic model: the Messages API. A refusal gives no translation"""
+        model = str(c.get("model") or "claude-sonnet-5-5")
+        body = {"model": model, "max_tokens": min(1500, 120 + len(text)), "system": system, "messages": [{"role": "user", "content": text}],
+                "output_config": {"effort": str(c.get("effort") or "low")}}   # a translation needs little thought; the captions want it fast
+        h = {"x-api-key": str(c.get("key") or os.environ.get("ANTHROPIC_API_KEY") or ""), "anthropic-version": "2026-10-21",
+             "content-type": "application/json"}
+        if model in CLAUDE_FALLBACKS:
+            body["fallbacks"] = "default"
+            h["anthropic-beta"] = "server-side-fallback-2026-07-01"
+        async with cs.post(str(c.get("url") or CLAUDE_URL).rstrip("/") + "/v1/messages", json=body, headers=h) as r:
+            # an overloaded or rate-limited API is "not there" for a while, like a server down - whatever its body is (a proxy's
+            # HTML page too); a bad request is this text's alone
+            if r.status == 429 or r.status >= 500:
+                raise ClientError(f"{r.status}")
+            d = await r.json(content_type=None)
+            if not isinstance(d, dict):
+                raise ValueError(f"{r.status}: not an object")
+            if r.status >= 400 or d.get("type") == "error":
+                e = d.get("error") if isinstance(d.get("error"), dict) else {}
+                raise ValueError(f"{r.status} {e.get('type', '')}: {str(e.get('message', ''))[:100]}")
+        if d.get("stop_reason") == "refusal":
+            return ""
+        return "".join(b.get("text", "") for b in d.get("content") or [] if b.get("type") == "text")
 
     async def tr(self, text: str, src: str, dst: str, live: bool = False) -> str:
         """`text` (said in `src`, "" = whatever language) in `dst`; "" when it cannot be had. `live`: a caption - not worth a
@@ -4182,7 +4433,7 @@ class Translator:
         if k in self.memo:
             return self.memo[k]
         c = self.conf()
-        if not c.get("url") or time.time() < self.down or self.busy >= (6 if live else 16):
+        if not self.ready() or time.time() < self.down or self.busy >= (6 if live else 16):
             return ""
         to = CC_LANGS[dst]
         sys_ = (f"You translate speech from {CC_LANGS[src]} into {to}." if src in CC_LANGS else f"You translate speech into {to}.") + \
@@ -4194,12 +4445,15 @@ class Translator:
                 **(c["extra"] if isinstance(c.get("extra"), dict) else {} if c.get("key") else {"chat_template_kwargs": {"enable_thinking": False}})}
         self.busy += 1
         try:
-            async with contextlib.nullcontext() if live else self.slow, ClientSession(timeout=ClientTimeout(total=8 if live else 40)) as cs, \
-                    cs.post(str(c["url"]).rstrip("/") + "/v1/chat/completions", json=body,
-                            headers={"Authorization": f"Bearer {c['key']}"} if c.get("key") else {}) as r:
-                d = await r.json(content_type=None)
-                out = str(d["choices"][0]["message"]["content"] or "")
-        except (ClientError, asyncio.TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as x:
+            async with contextlib.nullcontext() if live else self.slow, ClientSession(timeout=ClientTimeout(total=8 if live else 40)) as cs:
+                if c.get("provider") == "anthropic":
+                    out = await self._claude(cs, c, sys_, text)
+                else:
+                    async with cs.post(str(c["url"]).rstrip("/") + "/v1/chat/completions", json=body,
+                                       headers={"Authorization": f"Bearer {c['key']}"} if c.get("key") else {}) as r:
+                        d = await r.json(content_type=None)
+                        out = str(d["choices"][0]["message"]["content"] or "")
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError, AttributeError) as x:
             self.error = f"{type(x).__name__}: {str(x)[:120]}"
             if isinstance(x, (ClientError, asyncio.TimeoutError, OSError)):
                 self.down = time.time() + 20             # the server is not there; an answer of the wrong shape is this text's alone
@@ -4254,18 +4508,115 @@ def eleven_key() -> str:
     return ""
 
 
+# speech to text of our own (the owner, #3847): stt.json {"url": "http://<box>:8001", "token": "<secret>"} in the chat's config
+# folder or in .lagomchat of the working copy - Whisper on a box of the LAN (tools/stt_server.py), speaking the protocol of
+# ElevenLabs' realtime Scribe. A page gets a ticket for one line and opens it at /api/stt_ws; the server passes it through. The
+# box not answering: ElevenLabs, as before, for half a minute
+_STT = {"ok": 0.0, "down": 0.0}
+_stt_tickets: dict[str, tuple[str, float]] = {}         # a ticket -> (whose, valid till)
+_stt_open: dict[str, int] = {}                          # a person -> their lines open now
+
+
+def stt_conf() -> dict:
+    for f in (auth.CONF / "stt.json", _install_file("stt.json")):
+        try:
+            c = json.loads(f.read_text()) if f and f.is_file() else None
+        except (OSError, ValueError):
+            c = None
+        if isinstance(c, dict) and re.match(r"https?://", str(c.get("url") or "")):
+            return c
+    return {}
+
+
+def stt_down(why: str) -> None:
+    _STT["ok"], _STT["down"] = 0.0, time.time() + 30
+    print(f"[stt] our own speech to text: {why} - ElevenLabs for now", flush=True)
+
+
+async def stt_local_up() -> bool:
+    c, now = stt_conf(), time.time()
+    if not c or now < _STT["down"]:
+        return False
+    if now - _STT["ok"] < 10:
+        return True
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=2)) as cs, cs.get(c["url"].rstrip("/") + "/health") as r:
+            if r.status == 200:
+                _STT["ok"] = now
+                return True
+            stt_down(f"health {r.status}")
+    except (ClientError, asyncio.TimeoutError, OSError) as x:
+        stt_down(type(x).__name__)
+    return False
+
+
+async def ws_stt(req: web.Request) -> web.WebSocketResponse:
+    """a page's line to our own speech to text, by its ticket (api/stt_token): passed through both ways. A person has 3 lines
+    open at most (a page has two: captions and push to talk); a line silent for two minutes is closed"""
+    tk, c = _stt_tickets.pop(req.query.get("token", ""), None), stt_conf()
+    if not tk or tk[1] < time.time() or not c:
+        raise web.HTTPForbidden(text="no ticket")
+    who = tk[0]
+    if _stt_open.get(who, 0) >= 3:
+        raise web.HTTPTooManyRequests(text="too many lines")
+    ws = web.WebSocketResponse(heartbeat=25, max_msg_size=4 << 20)
+    await ws.prepare(req)
+    q = {k: v for k, v in req.query.items() if k in ("audio_format", "language_code", "vad_silence_threshold_secs", "commit_strategy")}
+    url = re.sub(r"^http", "ws", c["url"].rstrip("/")) + "/v1/speech-to-text/realtime"
+    _stt_open[who] = _stt_open.get(who, 0) + 1
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=None, sock_connect=3)) as cs, \
+                cs.ws_connect(url, params=q, headers={"Authorization": f"Bearer {c.get('token', '')}"}, heartbeat=25, max_msg_size=4 << 20) as up:
+            async def back():
+                with contextlib.suppress(ClientError, ConnectionResetError, RuntimeError):
+                    async for m in up:
+                        if m.type == WSMsgType.TEXT:
+                            await ws.send_str(m.data)
+                await ws.close()
+            bt = asyncio.create_task(back())
+            try:
+                while not ws.closed:
+                    m = await ws.receive(timeout=120)
+                    if m.type != WSMsgType.TEXT or up.closed:
+                        break
+                    await up.send_str(m.data)
+            finally:
+                bt.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await bt
+    except (ClientError, OSError) as x:
+        stt_down(type(x).__name__)
+    except asyncio.TimeoutError:
+        pass                                             # two minutes of nothing from the page
+    finally:
+        _stt_open[who] -= 1
+        if not _stt_open[who]:
+            del _stt_open[who]
+        await ws.close()
+    return ws
+
+
 async def api_stt_token(req: web.Request) -> web.Response:
-    """POST: a single-use token for one realtime transcription session of this person's microphone; one per 5 s a person"""
+    """POST: a single-use token for one realtime transcription session of this person's microphone; one per 5 s a person.
+    The answer says {local: true} when it is a ticket for our own speech to text (ws_stt), else it is ElevenLabs' token"""
     v = await need_viewer(req)
     if not _same_page(req):
         return web.json_response({"ok": False, "error": "refused: another site's page"}, status=403)
-    key = eleven_key()
-    if not key:
+    local = await stt_local_up()
+    key = "" if local else eleven_key()
+    if not local and not key:
         return web.json_response({"ok": False, "error": "off"})
     k, now = viewer_key(v), time.time()
     if now - _stt_last.get(k, 0) < 5:
         return web.json_response({"ok": False, "error": "too_often"}, status=429)
     _stt_last[k] = now
+    if local:
+        for t in [t for t, (_, end) in _stt_tickets.items() if end < now]:
+            del _stt_tickets[t]
+        t = secrets.token_urlsafe(24)
+        _stt_tickets[t] = (k, now + 60)
+        print(f"[stt] a ticket for {v['name']} (our own)", flush=True)
+        return web.json_response({"ok": True, "token": t, "local": True}, headers={"Cache-Control": "no-store"})
     try:
         async with ClientSession(timeout=ClientTimeout(total=10)) as cs, cs.post(f"{ELEVEN_API}/v1/single-use-token/realtime_scribe", headers={"xi-api-key": key}) as r:
             d = await r.json(content_type=None) if r.status == 200 else {}
@@ -4320,7 +4671,7 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
     lo = max(start, evs[0]["id"] if evs else start)
     await ws.send_str(json.dumps({"type": "init", "seen": _seen_here(req, me), "peer": me["peer"], "sps": {str(k): {**{x: v[x] for x in ("uri", "pos", "paused")}, "age": round(time.time() - v["at"], 2)} for k, v in chat.sps.items() if time.time() - v["at"] < 6 * 3600}, "me": {k: me[k] for k in ("role", "name", "id", "task", "avatar", "signed", "enforced", "acct_name")},
                                   "presence": chat.presence(me["role"] == "owner", me),
-                                  "agents": chat.roster(), "known": chat.known_agents(), "allow_all": chat.allow_all, "sound_presets": SOUND_PRESETS, "stt": bool(eleven_key()), "rimgs": _rimgs_out(), "photo": chat.photos.get(me.get("task") or ""), "loops": {str(i): v for i, v in chat.loops.items() if i >= lo}, "events": evs, "v": page_version(), "title": chat.title, "title_tr": chat.title_tr, "aliases": chat.aliases.get(viewer_key(me), {}), "names": chat.dnames, "agent_cols": chat.agent_cols,
+                                  "agents": chat.roster(), "known": chat.known_agents(), "allow_all": chat.allow_all, "sound_presets": SOUND_PRESETS, "stt": bool(eleven_key() or stt_conf()), "rimgs": _rimgs_out(), "photo": chat.photos.get(me.get("task") or ""), "loops": {str(i): v for i, v in chat.loops.items() if i >= lo}, "events": evs, "v": page_version(), "title": chat.title, "title_tr": chat.title_tr, "aliases": chat.aliases.get(viewer_key(me), {}), "names": chat.dnames, "agent_cols": chat.agent_cols,
                                   "acks": {str(i): v for i, v in chat.acks.items() if i >= lo},
                                   "trans": {str(i): v for i, v in chat.trans.items() if chat.sees(i, start) and i not in chat.deleted},
                                   "cctr": {str(i): v for i, v in chat.cctr.items() if chat.sees(i, start)}, "cc_tr": TR.ready(),
@@ -4491,6 +4842,16 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
                         await chat.idle_back(me)
                     await chat.send_presence()
                 continue
+            if q.get("pad_new") is not None:                     # a scratchpad put into the chat (the owner, #3741), with a caption or none
+                if me["role"] in ("owner", "verified") and _ws_rate(me, "pad_new", 1):
+                    await chat.post("msg", {"name": me["name"], "task": me["task"]}, " ".join(str(q["pad_new"]).split())[:300], None, pad=1)
+                continue
+            if isinstance(q.get("pad"), dict):                   # drawing on one: what is drawn goes to every page that sees it
+                if me["role"] in ("owner", "verified") and _ws_rate(me, "pad", 80):
+                    bad = await chat.pad_draw(q["pad"], me, start)
+                    if bad:
+                        await send(ws, json.dumps({"type": "error", "error": bad}))
+                continue
             if q.get("pvote") is not None:                       # a person's pick in a poll (toggles; the owner, #1386)
                 if me["role"] in ("owner", "verified"):
                     try:
@@ -4635,15 +4996,19 @@ async def ws_watch(req: web.Request) -> web.WebSocketResponse:
             # "! <command>" from the owner to named agents (the owner): the listener of an agent started with
             # `agentchat listen --shell` runs it in its folder and answers with the output. Only the owner's page sets it; never @all
             shm = SHELL_RE.match(text) if me["role"] == "owner" and to and not every else None
-            # what live captions heard this person say up to a pause, as a voice message (the owner, #3617): marked, so the pages
-            # show where it is from; its words are then put into the language the speaker asked for
-            cc = q["cc"] if isinstance(q.get("cc"), dict) and me["role"] in ("owner", "verified") and CC_VOICE_RE.match(text) \
-                and not to and not rep and _ws_rate(me, "ccmsg", 1) and _cc_may(me, text) else None
-            ccl = cc.get("l") if cc and cc.get("l") in CC_LANGS else ""
+            # a voice message with its words, put into other languages and kept under it: what live captions heard this person say
+            # up to a pause (`cc`, the owner, #3617 - marked, so the pages show where it is from; never addressed nor a reply), or a
+            # push to talk (`tr`, #3830 - an ordinary message otherwise: agents hear it, it is pushed)
+            cc = isinstance(q.get("cc"), dict) and not to and not rep
+            tq = q["cc"] if cc else q.get("tr")
+            if not (isinstance(tq, dict) and me["role"] in ("owner", "verified") and CC_VOICE_RE.match(text) and _ws_rate(me, "ccmsg", 1)
+                    and _cc_may(me, text)):
+                tq = None
+            tl = tq.get("l") if tq and tq.get("l") in CC_LANGS else ""
             e = await chat.post("msg", {"name": me["name"], "task": me["task"]}, text, to, reply=rep, doc=doc_of(q), all=every or None,
-                                sh=shm.group(1).strip() if shm else None, cc={"l": ccl} if cc is not None else None)
-            if cc is not None:
-                asyncio.create_task(chat.cc_tr(e, ccl, str(cc.get("to") or "")))
+                                sh=shm.group(1).strip() if shm else None, cc={"l": tl} if cc and tq is not None else None)
+            if tq is not None:
+                asyncio.create_task(chat.cc_tr(e, tl, str(tq.get("to") or "")))
     finally:
         chat.watchers.discard(ws)
         chat.viewers.pop(ws, None)
@@ -4864,11 +5229,19 @@ def settings() -> dict:
 # Every setting of the page and the profile, for the chats picked (the owner, #3523): "off" names the chats left out (one not
 # named takes part, a new one too); a value is kept even when empty, so a key that is not there was never shared
 SHARED_PREFS = Path(os.environ.get("LAGOMCHAT_SHARED_PREFS", Path.home() / ".config/agentchat-chats/prefs.json"))
-PREF_KEYS = {"ac_theme", "ac_lang", "ac_tsz", "ac_tbs", "ac_sbs", "ac_side", "ac_enter", "ac_hidevotes", "ac_hidesys", "ac_hidetr",
-             "ac_joinsnd", "ac_awayafter", "ac_hideviews", "ac_cord", "ac_caps", "ac_capsl", "ac_capst", "ac_capsv", "ac_mirror", "ac_micgain", "ac_agsort", "ac_agrev",
-             "ac_ppsort", "ac_pprev", "ac_camfold", "ac_fold_roster", "ac_fold_sv", "ac_fold_cal", "ac_aside_w", "ac_aside_off",
+# (the theme, the panels, the camera and the captions are each chat's own: OWN_KEYS, never shared - audit)
+PREF_KEYS = {"ac_padc", "ac_padw", "ac_lang", "ac_tsz", "ac_tbs", "ac_sbs", "ac_side", "ac_enter", "ac_hidevotes", "ac_hidesys", "ac_hidetr",
+             "ac_joinsnd", "ac_awayafter", "ac_hideviews", "ac_cord", "ac_agsort", "ac_agrev", "ac_ppsort", "ac_pprev",
              "sv_showlang", "sv_showtz", "sv_nocc",                    # what a chat keeps by the person: its page sets it there
              "pf_name", "pf_color", "pf_mono", "pf_yt", "pf_status", "pf_snd_in", "pf_snd_out", "pf_photo"}
+# what each chat keeps for itself, by the person and the chat's address (the owner, #3802): the theme, the side panel, the camera's
+# and the microphone's settings. A chat shown in a split pane of the Mac app has a storage of its own there (WebKit keeps a
+# frame's apart by the page around it), so the browser alone lost them: the page takes them from here
+OWN_KEYS = {"ac_thm", "ac_aside_w", "ac_aside_off", "ac_mirror", "ac_micgain", "ac_camfold", "ac_caps", "ac_capsl", "ac_capst", "ac_capsv"}
+
+
+def _own_key(k) -> bool:
+    return isinstance(k, str) and (k in OWN_KEYS or re.fullmatch(r"ac_fold_[a-z0-9_]{1,24}", k) is not None)
 
 
 def _shared_prefs_load() -> dict:
@@ -4970,7 +5343,7 @@ async def api_prefs(req: web.Request) -> web.Response:
         cur = _shared_prefs_load().get(em) or {}
         here, urls, titles = _prefs_chats(req, em)
         return web.json_response({"ok": True, "all": bool(cur.get("all")), "off": cur.get("off") or [], "here": here, "urls": urls, "titles": titles,
-                                  "prefs": cur.get("prefs") or {}}, headers={"Cache-Control": "no-store"})
+                                  "prefs": cur.get("prefs") or {}, "own": (cur.get("own") or {}).get(here) or {}}, headers={"Cache-Control": "no-store"})
     if not _same_page(req):
         return web.json_response({"ok": False, "error": "refused: another site"}, status=403)
     try:
@@ -4996,12 +5369,24 @@ async def api_prefs(req: web.Request) -> web.Response:
                 if k in PREF_KEYS:
                     p[k] = "" if val is None else str(val)[:300]
             cur["prefs"] = p
+        if isinstance(q.get("own"), dict) and here:
+            own = dict(cur.get("own") or {})
+            m = dict(own.get(here) or {})
+            for k, val in list(q["own"].items())[:60]:
+                if not _own_key(k):
+                    continue
+                if val is None or val == "":
+                    m.pop(k, None)                       # gone back to the default: not kept
+                elif k in m or len(m) < 100:              # a page's own settings: a hundred at most (audit)
+                    m[k] = str(val)[:300]
+            own[here] = m
+            cur["own"] = own
         d[em] = cur
         tmp = SHARED_PREFS.with_name(f"{SHARED_PREFS.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1))
         tmp.replace(SHARED_PREFS)
     return web.json_response({"ok": True, "all": bool(cur.get("all")), "off": cur.get("off") or [], "here": here, "urls": urls, "titles": titles,
-                              "prefs": cur.get("prefs") or {}})
+                              "prefs": cur.get("prefs") or {}, "own": (cur.get("own") or {}).get(here) or {}})
 
 
 # the left rail's list of chats, its order and folders (the owner, #2777): one copy for every chat on this machine, kept here by the
@@ -6321,6 +6706,12 @@ async def version_loop() -> None:
 PAGE_AT: dict = {}                                   # the page as it is served now: its tag, when it was first served
 
 
+async def split_page(_req):
+    """the window split into several chats (the owner, #3776): each pane a chat's own page in a frame, the layout in the
+    address' hash. The page holds nothing of the chat: the frames sign in as the chats' pages do"""
+    return web.FileResponse(HERE / "split.html", headers={"Cache-Control": "no-cache"})
+
+
 async def page(_req):
     # a chat that moved (#1987): its old address sends the browser to the same name on the new domain, the path and query kept
     host = (_req.headers.get("X-Forwarded-Host") or _req.headers.get("Host", "")).split(":")[0].lower()
@@ -6535,6 +6926,17 @@ async def api_skills(req):
 async def api_agents(req):
     await need_viewer(req)
     return web.json_response(chat.roster())
+
+
+async def api_pad(req: web.Request) -> web.Response:
+    """the strokes of a scratchpad (#3741), for a page that shows it: who drew what, in which colour"""
+    v = await need_viewer(req)
+    mid = _int(req.query.get("id"))
+    e = next((x for x in chat.events if x["id"] == mid), None)
+    if not e or not e.get("pad") or mid in chat.deleted or not chat.sees(mid, chat.start_for(v)):
+        return web.json_response({"ok": False, "error": "no such scratchpad"}, status=404)
+    pad = chat.pad_of(mid)
+    return web.json_response({"ok": True, "s": pad["s"], "o": pad["o"]})
 
 
 async def api_events(req: web.Request):
@@ -7055,7 +7457,8 @@ message is spent on it. Write it as `<name> [####------] <n>% <what now>` in you
     lagomchat status "Build 55 [####------] 41% cooking 1120 of 1682"
     lagomchat status                                    (alone: takes it off, when the job is dealt with)
 
-- 120 characters at most, no emoji. It stays until changed: your messages do not clear it (they clear `lagomchat working`).
+- 120 characters at most, no emoji. It stays until changed: your messages do not clear it (they clear `lagomchat working`; a
+  Claude Code session's `working` stays till the end of the turn in which it wrote).
 - Send it only when the line changed, every 10 seconds at most, from a script in the background that ends with the job.
   One writer at a time: the last status wins. The session or the script ends: the bar stays as it was, so take it off.
 - The card shows by itself how long the job has been going and about how long is left, by the pace of the percent: keep
@@ -7338,6 +7741,7 @@ def main():
             if f.is_file() and time.time() - f.stat().st_mtime > UP_KEEP:
                 f.unlink(missing_ok=True)
     app.router.add_get("/", page)
+    app.router.add_get("/split", split_page)
     # plugins of this install (`plugins` in .lagomchat/config.json, or LAGOMCHAT_PLUGINS="a.b,c.d"): modules beside this file,
     # each with setup(app, viewer_of, get_chat) adding its own routes; one that fails to load is skipped with a line in the log
     for name in plugin_names():
@@ -7357,6 +7761,7 @@ def main():
     app.router.add_route("*", "/join/knock", join_knock)   # an agent elsewhere asks the owner in; GET: its answer
     app.router.add_get("/api/agents", api_agents)
     app.router.add_get("/api/events", api_events)
+    app.router.add_get("/api/pad", api_pad)
     app.router.add_get("/api/days", api_days)
     app.router.add_post("/api/perf", api_perf)
     app.router.add_get("/api/export", api_export)
@@ -7375,6 +7780,7 @@ def main():
     app.router.add_route("*", "/api/import", api_import)
     app.router.add_get("/api/clocks", api_clocks)
     app.router.add_post("/api/stt_token", api_stt_token)
+    app.router.add_get("/api/stt_ws", ws_stt)
     app.router.add_get("/api/pr/diff", api_pr_diff)
     app.router.add_get("/api/pr/file", api_pr_file)
     app.router.add_route("*", "/api/pr/comments", api_pr_comments)

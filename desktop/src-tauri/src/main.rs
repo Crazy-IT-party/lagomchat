@@ -5,8 +5,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::webview::NewWindowResponse;
-use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
+use tauri::webview::{DownloadEvent, NewWindowResponse};
+use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
 
 // the app's own start page, where the chat's address is entered
 #[cfg(not(windows))]
@@ -146,7 +146,17 @@ fn page_window(
         builder = builder
             // the page knows it is in the app by this mark (the badge is drawn only here); the start page and the settings window have no use for it
             .initialization_script(format!("window.__acApp = 1; {ver}"))
+            .on_navigation(|u| {
+                note_nav(u);
+                true
+            })
             .on_document_title_changed(|window, title| {
+                // Cmd+W on a page that has nothing of its own to close (one chat, not split): the window (the owner, #3799)
+                if title.ends_with(" [close]") {
+                    let _ = window.close();
+                    return;
+                }
+                keep_page(window.app_handle());
                 let (title, notice) = split_notify(&title);
                 if let Some((t, b)) = notice {
                     notify(window.app_handle(), t, b);
@@ -179,6 +189,30 @@ fn page_window(
         .min_inner_size(min.0, min.1)
         // the page takes dropped files itself
         .disable_drag_drop_handler()
+        // a download (the picture viewer's Save, a file's Download; the owner, #3726: saving did nothing, the webview cancels
+        // a download that has no handler): into Downloads under a name not taken yet, then shown in the Finder. macOS does not
+        // say where a finished one went, so the place is kept from its start, by its address
+        .on_download({
+            let going: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+            move |_webview, event| {
+                match event {
+                    DownloadEvent::Requested { url, destination } => {
+                        going.lock().unwrap().push((url.to_string(), destination.clone()));
+                    }
+                    DownloadEvent::Finished { url, path, success } => {
+                        let mut g = going.lock().unwrap();
+                        let kept = g.iter().position(|(u, _)| *u == url.to_string()).map(|i| g.remove(i).1);
+                        if success {
+                            if let Some(p) = path.or(kept) {
+                                let _ = tauri_plugin_opener::reveal_item_in_dir(p);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
+        })
         .on_new_window(|url, _features| {
             if matches!(url.scheme(), "http" | "https") {
                 let _ = tauri_plugin_opener::open_url(url.as_str(), None::<&str>);
@@ -206,6 +240,71 @@ fn page_window(
     Ok(())
 }
 
+// the main window's page at the app's quit, opened again at its start (the owner, #3802): a split window comes back with its
+// chats and their sizes (they are in the address), not the one chat the start page remembers
+fn last_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("last-page.txt"))
+}
+
+// the chat's site: where the main window went from the start page (or the page it was opened on). Only its pages are kept
+// for the next start - a site a link took the window to is not reopened as the app's own, nor the manager's wizard with its key
+static CHAT_SITE: Mutex<Option<String>> = Mutex::new(None);
+static AT_START: AtomicBool = AtomicBool::new(true);
+
+// a chat's host without its first name ("lab.lagom.game" -> "lagom.game"): the chats of one domain are one site (the rail
+// goes between them); an address of two names or a number keeps all of it
+fn site_of(u: &Url) -> Option<String> {
+    let h = u.host_str()?.to_lowercase();
+    let n: Vec<&str> = h.split('.').collect();
+    Some(if n.len() > 2 && h.parse::<std::net::IpAddr>().is_err() { n[1..].join(".") } else { h })
+}
+
+fn of_site(u: &Url, site: &str) -> bool {
+    u.host_str().map(str::to_lowercase).is_some_and(|h| h == site || h.ends_with(&format!(".{site}")))
+}
+
+fn is_manager(u: &Url) -> bool {
+    u.query_pairs().any(|(k, _)| k == "k")
+}
+
+// every navigation of the main window: the first one off the start page names the chat's site
+fn note_nav(u: &Url) {
+    if u.as_str().starts_with(START) || !matches!(u.scheme(), "http" | "https") {
+        AT_START.store(true, Ordering::SeqCst);
+    } else if !is_manager(u) && AT_START.swap(false, Ordering::SeqCst) {
+        *CHAT_SITE.lock().unwrap() = site_of(u);
+    }
+}
+
+fn keep_page(app: &AppHandle) {
+    let (Some(main), Some(f)) = (app.get_webview_window("main"), last_file(app)) else { return };
+    let Ok(u) = main.url() else { return };
+    let site = CHAT_SITE.lock().unwrap().clone();
+    if matches!(u.scheme(), "http" | "https") && !is_manager(&u) && site.is_some_and(|s| of_site(&u, &s)) {
+        let _ = std::fs::create_dir_all(f.parent().unwrap_or(Path::new(".")));
+        let _ = std::fs::write(f, u.as_str());
+    }
+}
+
+fn last_page(app: &AppHandle) -> Option<Url> {
+    let u: Url = std::fs::read_to_string(last_file(app)?).ok()?.trim().parse().ok()?;
+    if !matches!(u.scheme(), "http" | "https") || is_manager(&u) {
+        return None;
+    }
+    *CHAT_SITE.lock().unwrap() = site_of(&u);
+    AT_START.store(false, Ordering::SeqCst);
+    Some(u)
+}
+
+// the main window's page closes its split pane in use if it has one; it asks for the window through its title otherwise
+fn close_focused(app: &AppHandle) -> tauri::Result<()> {
+    let Some(w) = app.webview_windows().into_values().find(|w| w.is_focused().unwrap_or(false)) else { return Ok(()) };
+    if w.label() == "main" {
+        return w.eval("if (!(window.__acClose && window.__acClose())) document.title += ' [close]';");
+    }
+    w.close()
+}
+
 fn open_settings(app: &AppHandle) -> tauri::Result<()> {
     if let Some(w) = app.get_webview_window("settings") {
         return w.set_focus();
@@ -224,6 +323,9 @@ fn open_settings(app: &AppHandle) -> tauri::Result<()> {
 
 // back to the start page; the settings window belongs to the chat that is being left
 fn change_address(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(f) = last_file(app) {
+        let _ = std::fs::remove_file(f);              // the start page at the next start too
+    }
     if let Some(w) = app.get_webview_window("settings") {
         w.close()?;
     }
@@ -288,6 +390,8 @@ fn app_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &PredefinedMenuItem::select_all(app, None)?,
         ],
     )?;
+    // Cmd+W: the chat in use when the window is split into several, else the window (the owner, #3799)
+    let close = MenuItem::with_id(app, "close", "Close", true, Some("CmdOrCtrl+W"))?;
     let window = Submenu::with_items(
         app,
         "Window",
@@ -296,7 +400,7 @@ fn app_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &PredefinedMenuItem::minimize(app, None)?,
             &PredefinedMenuItem::maximize(app, None)?,
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::close_window(app, None)?,
+            &close,
         ],
     )?;
     Menu::with_items(app, &[&main, &edit, &window])
@@ -309,6 +413,7 @@ fn main() {
         .on_menu_event(|app, event| {
             let _ = match event.id().as_ref() {
                 "settings" => open_settings(app),
+                "close" => close_focused(app),
                 "address" => change_address(app),
                 "chats" => {
                     open_manager(app);
@@ -318,7 +423,8 @@ fn main() {
             };
         })
         .setup(|app| {
-            let start = WebviewUrl::App("index.html".into());
+            let last = last_page(app.handle());
+            let start = last.clone().map(WebviewUrl::External).unwrap_or_else(|| WebviewUrl::App("index.html".into()));
             page_window(app.handle(), "main", start, "LagomChat", (1200.0, 820.0), (420.0, 500.0))?;
             // the manager up in the background; no chat running yet: its wizard instead of the address page
             let handle = app.handle().clone();
@@ -330,7 +436,7 @@ fn main() {
                         }
                     }
                     // a chat of this working copy runs: the address page opens it when it remembers no other address
-                    Some((_, _, Some(first))) => {
+                    Some((_, _, Some(first))) if last.is_none() => {
                         if let (Some(main), Ok(mut u)) = (handle.get_webview_window("main"), START.parse::<Url>()) {
                             u.query_pairs_mut().append_pair("chat", &first);
                             let _ = main.navigate(u);
@@ -341,6 +447,37 @@ fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("the app failed to start");
+        .build(tauri::generate_context!())
+        .expect("the app failed to start")
+        .run(|app, event| {
+            if let RunEvent::ExitRequested { .. } = event {
+                keep_page(app);
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_site() {
+        let u = |s: &str| s.parse::<Url>().unwrap();
+        let s = site_of(&u("https://lab.lagom.game/")).unwrap();
+        assert_eq!(s, "lagom.game");
+        assert!(of_site(&u("https://orbitar.lagom.game/split#x"), &s));
+        assert!(!of_site(&u("https://evil-lagom.game/"), &s));
+        assert!(!of_site(&u("https://lagom.game.evil.com/"), &s));
+        assert_eq!(site_of(&u("http://127.0.0.1:8160/")).unwrap(), "127.0.0.1");
+        assert_eq!(site_of(&u("https://example.com/")).unwrap(), "example.com");
+        assert!(is_manager(&u("http://127.0.0.1:8159/?k=abc")));
+        assert!(!is_manager(&u("https://lab.lagom.game/?m=1")));
+        AT_START.store(true, Ordering::SeqCst);
+        note_nav(&u("http://127.0.0.1:8159/?k=abc"));
+        assert!(AT_START.load(Ordering::SeqCst));
+        note_nav(&u("https://lab.lagom.game/"));
+        assert_eq!(CHAT_SITE.lock().unwrap().as_deref(), Some("lagom.game"));
+        note_nav(&u("https://evil.com/"));
+        assert_eq!(CHAT_SITE.lock().unwrap().as_deref(), Some("lagom.game"));
+    }
 }
