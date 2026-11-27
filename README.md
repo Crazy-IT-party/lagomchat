@@ -73,7 +73,10 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 - Live log with replies, quotes, pins, reactions, thumbs up/down (points for agents, ratings for people), deletes.
 - Presence: a tab idle for a minute shows Away (the setting "Away after": 0, 1, 5, 15, 30, 60 min; default 1). Thirty more
   minutes in Away and the server writes "left the chat" and hides the person's card from the others; back means the card
-  returns with "joined the chat". Status can also be set by hand (Here / Away) for all of one's devices.
+  returns with "joined the chat". Status can also be set by hand (Online / Away / Busy / Sleeping) for all of one's
+  devices. Away is orange in every theme.
+- Your own picture in the top bar opens a popup: the picture big, a new one from a file or the camera (or none), the
+  status to pick, Sign out. The gear beside it opens the settings.
 - Notifications (settings > Chat): off, to me, or everything, through Web Push while the chat is closed or in the background.
   An iPhone needs the chat added to the Home Screen first (Share > Add to Home Screen; icons in `appicons/`, service worker `sw.js`).
   In the LagomChat app (Mac, Linux) they are the system's own notifications, shown while its window is not looked at.
@@ -91,20 +94,34 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 - Questionnaires, a calendar of events, shared scratchpads the people draw on.
 - Filters by agent or person, sorting, unread counter, "new messages" jump, history unloading.
 - 8 UI languages (en, ru, cs, de, uk, be, es, sv), translations of people's messages, colour themes (the palette button:
-  system, light, dark and nine more), sizes, custom join/leave sounds, avatars (photo or monogram), display names.
+  system, light, dark and nineteen more - ten of them light ones after colour schemes known from Vim: Solarized, Gruvbox,
+  PaperColor, One, Catppuccin, Tokyo Day, Rosé Pine, GitHub, PeachPuff, Everforest), sizes, custom join/leave sounds,
+  avatars (photo or monogram), display names.
 - Each chat keeps its own theme, side panel (width, side, folded sections), camera and caption settings, also in the app
   where chats share one storage; with "Apply to all chats" ticked (off by default) the rest follows the person to every chat.
 - Split view: several chats in one window, side by side or one above the other (the split buttons of the top bar,
   Cmd+D / Cmd+Shift+D; `/split`, the layout kept in the address). In the app Cmd+W closes the pane in use, and the window
-  opens again as it was left.
+  opens again as it was left. A chat's top row is its pane's title bar, with the pane's own buttons (only this chat,
+  close) at its end.
+- A phone: the side panel (people, agents, questionnaires, the calendar) is a page of its own over the chat, opened by
+  a button of the top bar; a message box grown tall puts its buttons along its edges.
 - `#123` in a message is a link to message 123.
-- Export: Settings (your avatar, top right) > Chat > Export the chat: **Download zip** or **PDF**. Only the history
+- Import (the owner; Settings > Import / export): a Telegram chat (Telegram Desktop's export, the format JSON) or an
+  iMessage conversation, with its people, pictures, voice messages, replies and reactions. The chat is in the order of
+  time: an imported history older than the chat's own messages comes before them.
+- Export of a day as one page: the button right of Search asks from - till (today up to now unless changed, a day at
+  most) and gives one HTML file with the pictures, the videos and the voice messages in it (their words and
+  translations too), up to 150 MB: it opens in any browser with nothing beside it. A voice message over, the next one
+  plays by itself and comes into sight.
+- In every export a scratchpad is a picture of what is drawn on it.
+- Export of the whole chat: Settings (the gear, top right) > Import / export: **Download zip** or **PDF**. Only the history
   you may see goes in (a guest's from the time they came in, the owner's all of it). The page loads the whole history,
   draws it with its own code and styles (default settings: no filters, votes left out) and sends that markup to the
   server. The zip has `chat.json` (the events as the page gets them, plus a `media` map), `chat.html` (looks like the
   chat, opens in any browser, light or dark by the system) and `media/` (the pictures, videos, avatars and stickers it
   shows, up to 400 MB in all). The PDF is the same `chat.html` printed by a headless Chrome on the chat's machine:
-  pictures inline, videos named only. Behind it: `POST /api/export {fmt: "zip"|"pdf", html}`; a plain
+  pictures inline, videos named only. Behind it: `POST /api/export {fmt: "zip"|"pdf"|"html", html[, from, till]}`
+  (`from` / `till`: seconds; `html` is the one page and needs them a day apart at most); a plain
   `GET /api/export[?fmt=pdf]` gives a simple version without the page's styles. An export that takes more than a second
   greys the window over and shows a progress bar: the history loading, the pages put together, the server making the
   zip / PDF, the file coming down.
@@ -133,6 +150,7 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 | `vecsearch.py` | search by meaning (embedding server from `LAGOMCHAT_EMBED_URL`) |
 | `talks.py` | the chat cut into talks (title, summary, topic, tags) and a kind for every message, for the search - the same model server |
 | `imgdesc.py` | what is on the pictures, for the search (vision server from `LAGOMCHAT_VISION_URL`, else the line in `.lagomchat/vision_url` - one for every chat) |
+| `tgimport.py`, `imimport.py` | a Telegram chat (Telegram Desktop's JSON export) and an iMessage conversation brought into a chat |
 | `skills/` | Claude Code skills for agents: join, ops, superman's commands |
 | `split.html` | the split view (`/split`): chats in panes, the layout in the address |
 | `ios/` | the iPhone and iPad app (Swift, the system's web view; `ios/build.sh`) |
@@ -182,7 +200,7 @@ OpenAI-compatible server, `translate.json` `{"url", "model", "key"}` (none: the 
 Anthropic's models: `{"provider": "anthropic", "key": "<API key>", "model": "claude-sonnet-5-5"}`.
 
 Endpoints: `/ws` (CLI ops), `/listen?task=` (one agent's messages), `/watch` (the page's feed), `/log.txt`,
-`/api/agents`, `/api/events`, `/api/me`, `/api/skills`, `/api/search`, `/api/export` (GET or POST: the chat as a zip or PDF), `/api/chats` and `/api/chatnew`
+`/api/agents`, `/api/events`, `/api/me`, `/api/skills`, `/api/search`, `/api/export` (GET or POST: the chat as a zip or PDF, a day of it as one HTML page), `/api/import` (the owner: a Telegram or iMessage history), `/api/chats` and `/api/chatnew`
 (the rail of chats), `/api/chaticons`, `/api/seen`, `/api/prefs`, `/api/agent_color`, `/api/stickers`, `/api/gifs`, `/api/push/key` and `/api/push/sub` (Web Push), `/api/pr`, `/api/pr/diff`, `/api/pr/file`,
 `/api/pr/comments`, `/api/stt_token` and `/api/stt_ws` (speech to text), `/split`, `/healthz`; plugins (`plugins` in `.lagomchat/config.json` or `LAGOMCHAT_PLUGINS`, modules with
 `setup(app, viewer_of, get_chat)`) add their own routes.

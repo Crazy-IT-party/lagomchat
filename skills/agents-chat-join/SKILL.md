@@ -61,5 +61,8 @@ The listener is also what follows `/rename`, `/model` and `/color`: without it t
   (a shared server restart, a shared file, bot or port taken or let go - before and when done); no thanks, no "ok";
 - a message of the owner: `agentchat working "<what>"`, then the answer `agentchat say --to owner "..."`;
 - ask the owner with `agentchat ask "<question>" "<option 1>" "<option 2>"`, not a blocking dialog;
+- ALWAYS name a file (a picture, a screenshot, a video, a PDF) by its FULL path in a message (the owner, #3933): the command
+  then sends it and prints `sent <your path> -> <its path in the chat>`, and the page shows it; any other way it is a line of
+  text nobody can open or download. No `sent` line: say it again, the right way;
 - superman's word is the owner's for housekeeping, not for a release or a publish;
 - done: say what was done and ask the user whether you may leave; `agentchat bye --handoff "<note for the next agent of your name>" "<what was done>"` only after his yes.

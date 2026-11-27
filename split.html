@@ -14,6 +14,7 @@
   .pane { position: absolute; display: flex; flex-direction: column; box-sizing: border-box; border: 1px solid var(--line); }
   .pane.act { border-color: var(--accent); }
   .pane header { flex: none; display: flex; align-items: center; gap: 2px; height: 26px; padding: 0 4px 0 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .pane.own header { display: none; }     /* a chat's page that shows the pane's title and buttons in its own top row (the owner, #3886) */
   .pane header b { flex: 1; min-width: 0; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
   .pane.act header b { color: var(--text); }
   .pane header button { width: 24px; height: 22px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; background: none; color: var(--muted); cursor: pointer; }
@@ -33,7 +34,7 @@
 // the layout: a pane {u: its chat's address} or a split {d: 'v' (side by side) | 'h' (one above the other), f: the first's share,
 // a, b}. It is the address' hash, so a reload or a bookmark brings the same back
 const $ = s => document.querySelector(s), box = $('#panes');
-try { const t = localStorage.getItem('ac_thm') || localStorage.getItem('ac_theme'); if (['light', 'sepia', 'sky', 'mint', 'rose'].includes(t) || ((!t || t === 'system') && matchMedia('(prefers-color-scheme: light)').matches)) document.documentElement.classList.add('light'); } catch { /* */ }
+try { const t = localStorage.getItem('ac_thm') || localStorage.getItem('ac_theme'); if ((t && !['system', 'dark', 'black', 'nord', 'forest', 'plum', 'ocean'].includes(t)) || ((!t || t === 'system') && matchMedia('(prefers-color-scheme: light)').matches)) document.documentElement.classList.add('light'); } catch { /* */ }
 const IC = {
   v: '<path d="M4 5h16v14H4zM12 5v14"/>', h: '<path d="M4 5h16v14H4zM4 12h16"/>',
   one: '<path d="M14 4h6v6M20 4l-8 8M10 5H5v14h14v-5"/>', x: '<path d="M6 6l12 12M18 6L6 18"/>',
@@ -70,6 +71,7 @@ function pane(u) {
   el.innerHTML = `<header><b></b>${['v', 'h', 'one', 'x'].map(k => `<button type="button" data-a="${k}" title="${L[k]}" aria-label="${L[k]}">${ico(k)}</button>`).join('')}</header>`;
   const src = ok(u) || new URL('./', location.href).href, o = new URL(src).origin;
   fr.allow = allowFor(o); fr.src = src;
+  fr.addEventListener('load', () => el.classList.remove('own'));   // a page loaded anew says again whether it has the bar
   el.append(fr); box.append(el);
   panes.set(id, { el, fr, u: src, t: '', o });
   return { p: id };
@@ -116,10 +118,13 @@ const byWin = w => [...panes.entries()].find(([, p]) => p.fr.contentWindow === w
 addEventListener('message', e => {
   const hit = byWin(e.source), d = e.data; if (!hit || !d || typeof d !== 'object') return;
   const [id, p] = hit;
-  if (d.lc === 'here') { const u = ok(d.u); if (u) p.u = u;
+  if (d.lc === 'here') { const u = ok(d.u); if (u) p.u = u; p.el.classList.toggle('own', !!d.bar);
     if (u && new URL(u).origin !== p.o) { p.o = new URL(u).origin; p.fr.allow = allowFor(p.o); p.fr.src = u; } p.t = String(d.t || '').slice(0, 120); p.el.querySelector('header b').textContent = p.t; save(); }
   else if (d.lc === 'split') split(id, d.d === 'h' ? 'h' : 'v');
   else if (d.lc === 'focus') { act = id; place(); }
+  else if (d.lc === 'bar') p.el.classList.add('own');
+  else if (d.lc === 'one') location.href = p.u;
+  else if (d.lc === 'close') close(id);
 });
 // the pane in use: the one whose frame took the focus last
 addEventListener('blur', () => setTimeout(() => { const a = document.activeElement, hit = a && a.tagName === 'IFRAME' && byWin(a.contentWindow); if (hit) { act = hit[0]; place(); } }));

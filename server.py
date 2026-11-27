@@ -24,7 +24,7 @@ at / - e.g. https://<slug>.<your domain> through a Cloudflare tunnel).
                  writes back {say: text, to: [names]}: a message of "owner" (the person; the names owner, user and those of <conf>/reserved_names are reserved) to all or to some
     /upload      POST a picture (raw body, png/jpeg/gif/webp, 25 MB): saved in ~/agentchat-uploads (two weeks), {path} back
     /img         ?p=<path>: an image file under /tmp, the uploads and the folders of <conf>/img_roots (the page shows the images a message names)
-    /log.txt     the log as text; /api/agents; /api/events?before=<id>&n=<count>; /healthz
+    /log.txt     the log as text; /api/agents; /api/events?before=<order key>&n=<count> (after=, to=, around=); /healthz
 """
 from __future__ import annotations
 
@@ -118,6 +118,35 @@ WAKE_DELAY, SOON_DELAY, QUIET_DELAY = (float(os.environ.get(k, d)) for k, d in
                                        (("LAGOMCHAT_WAKE", 3), ("LAGOMCHAT_SOON", 45), ("LAGOMCHAT_QUIET", 900)))
 HELLO_RECENT, CLIP = 8, 240   # a hello shows the last 8 messages, each cut at 240 chars
 HELLO_EXAMPLES, HANDOFF_MAX = 3, 4000   # a hello also shows this many examples of each kind, and the note the last agent of that name left
+
+
+# the chat's order is the order of time (the owner, #3883): a history imported into a chat that already had messages takes the
+# next ids, yet it was written before them. Such a message gets an order key `o` of its own, between the keys of the messages
+# around it in time; every other message's key is its id. The log, the pages and the history's pages go by the key; the ids stay
+def okey(e: dict) -> float:
+    return e.get("o", e["id"])
+
+
+def import_order(old: list[dict], new: list[dict]) -> dict[int, float]:
+    """the order keys of imported messages put among the log's by their time: {id: key}, only for those whose key is not their id.
+    `old` is the log in its order (its times rise with it); `new` the imported messages, with their ids in the log"""
+    ts = [x["ts"] for x in old]
+    at: dict[int, list[dict]] = {}
+    for e in sorted(new, key=lambda x: (x["ts"], x["id"])):
+        at.setdefault(bisect.bisect_right(ts, e["ts"]), []).append(e)
+    out = {}
+    for p, g in at.items():
+        lo, hi, k = okey(old[p - 1]) if p else None, okey(old[p]) if p < len(old) else None, len(g)
+        for j, e in enumerate(g):
+            if hi is None:                                # after everything: its own id, when that is after the last one
+                o = e["id"] if lo is None or e["id"] > lo else lo + (j + 1) / (k + 1)
+            elif lo is None:                              # before everything: the keys under the first one
+                o = hi - k + j
+            else:                                         # between two messages: keys between theirs
+                o = lo + (hi - lo) * (j + 1) / (k + 1)
+            if o != e["id"]:
+                out[e["id"]] = int(o) if o == int(o) else o
+    return out
 
 
 class Chat:
@@ -435,7 +464,8 @@ class Chat:
                 except (ValueError, KeyError, TypeError):
                     pass
         self.agent_run, self.agent_paused = 0, False   # agents' messages in a row with no person's (#2285)
-        self.next_id = self.events[-1]["id"] + 1 if self.events else 1
+        self.order_load()
+        self.next_id = max(e["id"] for e in self.events) + 1 if self.events else 1
         # a purge may take the newest lines: the ids go on from where they were, the votes, replies and pins of the old ones never match a new one
         self.next_id_file = DATA / "next_id"
         try:
@@ -634,7 +664,7 @@ class Chat:
     def public(self, e: dict) -> dict:
         """an event as the page and the API show it: a deleted message is only a mark of where it was"""
         if e["id"] in self.deleted:
-            return {"id": e["id"], "ts": e["ts"], "kind": "del", "agent": e["agent"], "task": e["task"], "text": ""}
+            return {"id": e["id"], "ts": e["ts"], "kind": "del", "agent": e["agent"], "task": e["task"], "text": "", **({"o": e["o"]} if "o" in e else {})}
         return e
 
     def rated(self, e: dict) -> tuple[dict, dict]:
@@ -674,12 +704,12 @@ class Chat:
                 await send(ws, s)
 
     def first_for(self, start: int) -> int:
-        """the id of the first event such a person may load: where they came, or an older pinned message"""
+        """the order key of the first event such a person may load: where they came, or an older pinned message"""
         if not self.events:
             return 0
         have = {p["id"] for p in self.pins} - self.deleted
-        old = [e["id"] for e in self.events if e["id"] < start and e["id"] in have] if have and min(have) < start else []
-        return min(old) if old else max(start, self.events[0]["id"])
+        e = next((x for x in self.events if x["id"] >= start or x["id"] in have), None)
+        return okey(e) if e else max(start, okey(self.events[-1]) + 1)
 
     def view_for(self, e: dict, start: int, role: str) -> dict | None:
         """an event as this person sees it: None when it is from before they came (or a vote line, the owner's business); a quote of
@@ -743,18 +773,49 @@ class Chat:
                     out.update(o["src"] for o in self.pad_of(e["id"])["o"] if o.get("src"))
         return out
 
+    def order_load(self) -> None:
+        """the order keys of imported messages (order.json, {id: key}); made once from the imports' maps for a chat imported into
+        before the keys were (#3883). The log is put in the order of the keys"""
+        self.order_file = DATA / "order.json"
+        try:
+            self.order = {int(k): v for k, v in json.loads(self.order_file.read_text()).items()}
+        except (OSError, ValueError, AttributeError):
+            imp = set()
+            for f in DATA.glob("import_*.json"):
+                try:
+                    imp.update(int(v) for v in json.loads(f.read_text()).values())
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+            self.order = import_order([e for e in self.events if e["id"] not in imp], [e for e in self.events if e["id"] in imp]) if imp else {}
+            if imp:
+                self.order_file.write_text(json.dumps(self.order))
+        for e in self.events:
+            if e["id"] in self.order:
+                e["o"] = self.order[e["id"]]
+        if self.order:
+            self.events.sort(key=okey)
+
     def take_in(self, evs: list[dict], reacts: dict) -> int:
         """the messages of an import (tgimport.py; their ids count from 0) join the log under the chat's next ids, with the time
         they were sent at. No listener is woken by them: the agents' place in the log moves past. Returns the first id"""
         base = self.next_id
+        for e in evs:
+            e["id"] += base
+            if e.get("reply"):
+                e["reply"]["id"] += base
+        od = import_order(self.events, evs)
         with self.jsonl.open("a") as f, self.txt.open("a") as g:
             for e in evs:
-                e["id"] += base
-                if e.get("reply"):
-                    e["reply"]["id"] += base
-                self.events.append(e)
                 f.write(json.dumps(e, ensure_ascii=False) + "\n")
                 g.write(line(e) + "\n")
+        self.events.extend(evs)
+        if od:                                             # older than what the chat has: among it by time (#3883)
+            self.order.update(od)
+            self.order_file.write_text(json.dumps(self.order))
+            for e in evs:
+                if e["id"] in od:
+                    e["o"] = od[e["id"]]
+            self.events.sort(key=okey)
         self.next_id = base + len(evs)
         self.next_id_file.write_text(str(self.next_id))
         if reacts:
@@ -1252,13 +1313,12 @@ class Chat:
     async def viewed(self, ids: list, me: dict, start: int) -> None:
         """messages that stood on this person's screen (the owner, #2930): one view per person and message"""
         rid, now, new = str(self.rater_of(me)["id"]), round(time.time(), 3), []
-        for mid in ids[:200]:
-            if not isinstance(mid, int) or isinstance(mid, bool) or not self.sees(mid, start) or mid in self.deleted or rid in self.views.get(mid, ()):
-                continue
-            i = bisect.bisect_left(self.events, mid, key=lambda x: x["id"])
-            if i < len(self.events) and self.events[i]["id"] == mid and self.events[i]["kind"] == "msg":
-                self.views.setdefault(mid, {})[rid] = now
-                new.append(mid)
+        want = {mid for mid in ids[:200] if isinstance(mid, int) and not isinstance(mid, bool) and self.sees(mid, start)
+                and mid not in self.deleted and rid not in self.views.get(mid, ())}
+        for e in self.events if want else ():             # not by a binary search: the log goes by time, not by id (#3883)
+            if e["id"] in want and e["kind"] == "msg":
+                self.views.setdefault(e["id"], {})[rid] = now
+                new.append(e["id"])
         if not new:
             return
         with self.views_file.open("a") as f:
@@ -1355,7 +1415,7 @@ class Chat:
                 self.pic_ids.get(p, set()).discard(i)
         self.cctr_drop(ids)
         self.pad_drop(ids)
-        await self.watch_all({"type": "purged", "ids": sorted(ids), "first": self.events[0]["id"] if self.events else 0})
+        await self.watch_all({"type": "purged", "ids": sorted(ids), "first": okey(self.events[0]) if self.events else 0})
         if any(p["id"] in ids for p in self.pins):
             self.pins = [p for p in self.pins if p["id"] not in ids]
             self.pins_file.write_text(json.dumps(self.pins, ensure_ascii=False))
@@ -2061,7 +2121,7 @@ async def op(q: dict, ws) -> dict:
             return {"ok": False, "error": "since: a unix time; from_id: a message id"}
         kinds = set(q.get("kinds") or []) or None
         evs = [chat.public(e) for e in chat.events if e["ts"] >= since and e["id"] >= from_id and (kinds is None or e["kind"] in kinds)]
-        return {"ok": True, "events": evs, "first": chat.events[0]["id"] if chat.events else 0}
+        return {"ok": True, "events": evs, "first": okey(chat.events[0]) if chat.events else 0}
     if kind == "purge":
         # clean the chat between two times or messages, either bound may be left out (the owner, #14): superman's, like the history
         if a["name"].lower() not in DEPUTY:
@@ -6940,11 +7000,31 @@ async def api_pad(req: web.Request) -> web.Response:
 
 
 async def api_events(req: web.Request):
+    """a page of the history, by the events' order keys (okey): the `n` before the key `before`; the `n` after the key `after`;
+    those from the message `to` (an id) up to `before`, all of them; `n` each side of the message `around` (an id)"""
     v = await need_viewer(req)
     start = chat.start_for(v)
-    before = int(req.query.get("before", "0")) or chat.next_id
-    n = max(1, min(int(req.query.get("n", "500")), 5000))
-    got = [x for x in (chat.view_for(e, start, v["role"]) for e in chat.events if e["id"] < before) if x is not None][-n:]
+    q = req.query
+    try:
+        n = max(1, min(int(q.get("n", "500")), 5000))
+        before = float(q["before"]) if q.get("before") else math.inf    # a key may be 0 or under it: an import before everything
+        after = float(q["after"]) if q.get("after") else None
+        to, around = int(q.get("to") or 0), int(q.get("around") or 0)
+    except ValueError:
+        return web.json_response({"ok": False, "error": "before, after, to, around, n: numbers"}, status=400)
+    vis = [x for x in (chat.view_for(e, start, v["role"]) for e in chat.events) if x is not None]
+    keys = [okey(x) for x in vis]
+    at = next((i for i, x in enumerate(vis) if x["id"] == (around or to)), None) if around or to else None
+    if around:
+        got = vis[max(0, at - n): at + n + 1] if at is not None else []
+    elif to:
+        got = vis[at: bisect.bisect_left(keys, before)][:50000] if at is not None else []
+    elif after is not None:
+        i = bisect.bisect_right(keys, after)
+        got = vis[i: i + n]
+    else:
+        j = bisect.bisect_left(keys, before)
+        got = vis[max(0, j - n): j]
     return web.json_response({"events": got, "first": chat.first_for(start)})
 
 
@@ -6984,7 +7064,6 @@ async def api_days(req: web.Request):
         if e["kind"] != "msg" or not chat.sees(e["id"], start) or not a <= e.get("ts", 0) < b or e["id"] in chat.deleted:
             continue
         d = days.setdefault(datetime.fromtimestamp(e["ts"], tz).day, [e["id"], 0])
-        d[0] = min(d[0], e["id"])
         d[1] += 1
     return web.json_response({"ok": True, "y": y, "m": m, "days": days})
 
@@ -7197,8 +7276,10 @@ async def api_import(req: web.Request) -> web.Response:
 # the whole history this person may see (the same cut as the page: a guest from the time they came, the owner all of it) as a
 # zip: chat.json (the events as the page gets them), chat.html (to read in any browser, no outside files) and media/ (the
 # pictures and videos the messages name, the same checks as /img)
-EXPORT_MEDIA_RE = re.compile(r"(?:/[\w.@+\-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v)", re.I)
+EXPORT_MEDIA_RE = re.compile(r"(?:/[\w.@+\-]+)+\.(?:png|jpe?g|gif|webp|mp4|webm|mov|m4v|m4a|wav)", re.I)
 EXPORT_MEDIA_MAX = 400 * 2 ** 20         # all the media of one export together; what is over it stays a path
+EXPORT_HTML_MAX = 150 * 2 ** 20          # the same for the one-file page (#3911): the files sit in it as text, a third bigger
+EXPORT_SPAN_MAX = 86400                  # the one-file page holds a day at most (the owner, #3911)
 
 
 def _media_ok(raw: str) -> Path | None:
@@ -7207,7 +7288,7 @@ def _media_ok(raw: str) -> Path | None:
     except (OSError, RuntimeError, ValueError):
         return None
     ext = p.suffix.lower()
-    if not p.is_file() or not (ext in IMG_TYPES or ext in VID_TYPES) or not any(r in p.parents for r in IMG_ROOTS) \
+    if not p.is_file() or not (ext in IMG_TYPES or ext in VID_TYPES or ext in AUD_TYPES) or not any(r in p.parents for r in IMG_ROOTS) \
             or any(x.startswith(".") for x in p.parts):
         return None
     return p
@@ -7219,8 +7300,12 @@ def _export_html(title: str, evs: list[dict], media: dict, who: str, when: str, 
         for m in EXPORT_MEDIA_RE.finditer(text):
             out.append(html_escape(text[pos:m.start()]))
             rel = media.get(m.group(0))
-            if rel and Path(rel).suffix.lower() in VID_TYPES:
-                out.append(f'<i>[video {html_escape(Path(rel).name)}]</i>' if pdf else
+            ext = Path(m.group(0)).suffix.lower()
+            if rel and ext in AUD_TYPES:
+                out.append(f'<i>[voice {html_escape(Path(m.group(0)).name)}]</i>' if pdf else
+                           f'<audio controls preload="metadata" src="{html_escape(rel)}"></audio>')
+            elif rel and ext in VID_TYPES:
+                out.append(f'<i>[video {html_escape(Path(m.group(0)).name)}]</i>' if pdf else
                            f'<video controls preload="metadata" src="{html_escape(rel)}"></video>')
             elif rel:
                 out.append(f'<a href="{html_escape(rel)}"><img loading="lazy" src="{html_escape(rel)}" alt=""></a>')
@@ -7261,7 +7346,7 @@ def _export_html(title: str, evs: list[dict], media: dict, who: str, when: str, 
             f'<p class="sys">exported {html_escape(when)} by {html_escape(who)}, {len(evs)} events</p>{"".join(rows)}</body></html>')
 
 
-def _export_media(evs: list[dict]) -> tuple[dict, dict]:
+def _export_media(evs: list[dict], cap: int = EXPORT_MEDIA_MAX) -> tuple[dict, dict]:
     """the media the events name that may go out: {path in the text: "media/<name>"}, {path in the text: the file}"""
     media, used, total, names = {}, set(), 0, {}
     for e in evs:
@@ -7269,7 +7354,7 @@ def _export_media(evs: list[dict]) -> tuple[dict, dict]:
             if raw in media or raw in names:
                 continue
             p = _media_ok(raw)
-            if not p or total + p.stat().st_size > EXPORT_MEDIA_MAX:
+            if not p or total + p.stat().st_size > cap:
                 continue
             n, k = p.name, 1
             while n in used:
@@ -7286,6 +7371,52 @@ PAGE_FILE_RE = re.compile(r"img\?p=([^\"'&)\s]+)|"
                           r"(?<![\w/])(photo/[0-9a-f]{16}\.jpg|sticker/[0-9a-f]{16}\.(?:png|jpg|gif|webp)|rimg/[0-9a-f]{16}\.(?:png|jpg|gif|webp)|gif/[A-Za-z0-9]{1,40}\.gif)")
 
 
+def _page_file(u: str) -> Path | None:
+    """the file behind an address of the page's own: a photo, a sticker, a reaction's picture, a GIF's preview"""
+    kind, f = u.split("/", 1)
+    src = {"photo": chat.photos_dir / f, "sticker": STICKERS_DIR / f, "rimg": DATA / "react_imgs" / f, "gif": UPLOADS / f"gif-{f}"}[kind]
+    return src if src.is_file() else None
+
+
+def _data_uri(p: Path) -> str:
+    import base64
+    ext = p.suffix.lower()
+    mime = IMG_TYPES.get(ext) or VID_TYPES.get(ext) or AUD_TYPES.get(ext) or "application/octet-stream"
+    return f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()
+
+
+def _export_one(title: str, evs: list[dict], who: str, page: str = "") -> bytes:
+    """one page with everything in it (the owner, #3911): the pictures, the voice messages and the videos sit in the file itself,
+    so it opens in a browser from anywhere with no folder beside it. A file the page shows many times (a photo by every message
+    of its person) is written once, and a few lines of script at the end put it where it is shown"""
+    _, names = _export_media(evs, EXPORT_HTML_MAX)
+    if not page:
+        return _export_html(title, evs, {raw: _data_uri(p) for raw, p in names.items()}, who, time.strftime("%Y-%m-%d %H:%M")).encode()
+    files: dict = {}                                       # the file -> how many times the page shows it
+
+    def find(m: re.Match) -> Path | None:
+        if m.group(1):
+            return names.get(urllib.parse.unquote(m.group(1).replace("&amp;", "&")))
+        return _page_file(m.group(2))
+    for m in PAGE_FILE_RE.finditer(page):
+        f = find(m)
+        if f:
+            files[f] = files.get(f, 0) + 1
+    many = {f: i for i, f in enumerate(f for f, n in files.items() if n > 1)}
+
+    def one(m: re.Match) -> str:
+        f = find(m)
+        return m.group(0) if not f else f"lcm:{many[f]}:" if f in many else _data_uri(f)
+    page = PAGE_FILE_RE.sub(one, page)
+    if many:
+        js = ("<script>(()=>{const M=" + json.dumps([_data_uri(f) for f in many]).replace("</", "<\\/") + ";"
+              "for(const e of document.querySelectorAll('*'))for(const a of [...e.attributes])"
+              "if(a.value.includes('lcm:'))e.setAttribute(a.name,a.value.replace(/lcm:(\\d+):/g,(_,i)=>M[i]));})()</script>")
+        i = page.rfind("</body>")
+        page = page[:i] + js + page[i:] if i >= 0 else page + js
+    return page.encode()
+
+
 def _localize(page: str, media: dict, names: dict) -> tuple[str, dict]:
     """the page's own markup (the owner #272: the export looks like the chat): its server addresses become files in media/;
     a picture by path only when a message one may see names it (the markup comes from the browser)"""
@@ -7296,12 +7427,10 @@ def _localize(page: str, media: dict, names: dict) -> tuple[str, dict]:
             raw = urllib.parse.unquote(m.group(1).replace("&amp;", "&"))
             return media.get(raw, m.group(0))
         u = m.group(2)
-        kind, f = u.split("/", 1)
-        src = {"photo": chat.photos_dir / f, "sticker": STICKERS_DIR / f, "rimg": DATA / "react_imgs" / f,
-               "gif": UPLOADS / f"gif-{f}"}[kind]
-        if not src.is_file():
+        src = _page_file(u)
+        if not src:
             return u
-        rel = f"media/{kind}-{f}"
+        rel = "media/" + u.replace("/", "-", 1)
         extra[rel] = src
         return rel
     return PAGE_FILE_RE.sub(one, page), extra
@@ -7356,22 +7485,33 @@ async def api_export(req: web.Request):
     v = await need_viewer(req)
     start = chat.start_for(v)
     evs = [x for x in (chat.view_for(e, start, v["role"]) for e in chat.events) if x is not None]
-    pdf, page = req.query.get("fmt") == "pdf", ""        # the same as a PDF (the owner, #263)
+    fmt, page, span = req.query.get("fmt") or "zip", "", dict(req.query)     # the same as a PDF (the owner, #263)
     if req.method == "POST":                              # the page sends its own markup of the log (#272)
         if req.content_length and req.content_length > 40 * 2 ** 20:
             raise web.HTTPRequestEntityTooLarge(max_size=40 * 2 ** 20, actual_size=req.content_length)
         if _other_site(req):
             raise web.HTTPForbidden()
         q = await req.json()
-        pdf, page = q.get("fmt") == "pdf", str(q.get("html") or "")
+        fmt, page, span = str(q.get("fmt") or "zip"), str(q.get("html") or ""), q
+    if fmt not in ("zip", "pdf", "html"):
+        raise web.HTTPBadRequest()
+    if fmt == "html" or "from" in span or "till" in span:   # a part of the history, by the time (#3911); the one page: a day at most
+        try:
+            t1 = float(span.get("till") or time.time())
+            t0 = float(span["from"]) if span.get("from") not in (None, "") else time.mktime(time.localtime(t1)[:3] + (0, 0, 0, 0, 0, -1))
+        except (TypeError, ValueError, OverflowError):
+            raise web.HTTPBadRequest()
+        if not t0 < t1 or (fmt == "html" and t1 - t0 > EXPORT_SPAN_MAX):
+            return web.json_response({"ok": False, "error": "export: a day at most"}, status=400)
+        evs = [e for e in evs if t0 <= (e.get("ts") or 0) <= t1]
     try:
-        data = await asyncio.to_thread(_export_pdf if pdf else _export_zip, chat.title, evs, v.get("name") or "", page)
+        data = await asyncio.to_thread({"pdf": _export_pdf, "zip": _export_zip, "html": _export_one}[fmt], chat.title, evs, v.get("name") or "", page)
     except Exception as x:                                # no Chrome, a timeout: said, not a 500 page
         return web.json_response({"ok": False, "error": f"export: {x}"}, status=503)
     slug = re.sub(r"[^A-Za-z0-9]+", "-", chat.title).strip("-").lower() or "chat"
-    ext = "pdf" if pdf else "zip"
+    ext = fmt
     print(f"[export] {v.get('name')}: {ext}, {len(evs)} events, {len(data) // 1024} KB", flush=True)
-    return web.Response(body=data, headers={"Content-Type": "application/pdf" if pdf else "application/zip", "Cache-Control": "no-store",
+    return web.Response(body=data, headers={"Content-Type": {"pdf": "application/pdf", "zip": "application/zip", "html": "text/html; charset=utf-8"}[fmt], "Cache-Control": "no-store",
                                             "Content-Disposition": f'attachment; filename="{slug}-{time.strftime("%Y%m%d-%H%M")}.{ext}"'})
 
 
@@ -7406,7 +7546,8 @@ LagomChat: one chat for people and their AI agents. You join it, say what you wo
 
 ## 1. The command
 
-`command -v lagomchat` finds it already? Skip this step. Else:
+Get it, also when `command -v lagomchat` finds one already: an older copy lacks what the chat does now (it did not send
+the files a message names, the owner #3933):
 
     {get}
 
@@ -7443,9 +7584,10 @@ Exit code 2 of listen: say hello again, then listen. Exit code 3: the owner stop
 - To somebody: `lagomchat say --to <name> "..."`; to the owner: `--to owner`.
 - A question for the owner with buttons: `lagomchat ask "<question>" "<option 1>" "<option 2>"` instead of waiting for him in your terminal.
 - What you are doing now: `lagomchat working "<what>"`.
-- A picture, a screenshot, a short video or a PDF for the others to see: name the file in the message by its full path. The
-  command sends it and prints `sent <your path> -> <its path in the chat>`, and the page shows the picture itself; with no
-  such line the path stays a line of text that nobody can open. A file outside the folder you work in and the temp folders
+- ALWAYS NAME A FILE BY ITS FULL PATH (the owner, #3933): a picture, a screenshot, a short video or a PDF for the others to
+  see or to download is named in the message by its full path, from the root - never a name alone, never a path from the
+  folder you work in. The command sends it and prints `sent <your path> -> <its path in the chat>`, and the page shows the
+  picture itself; with no such line the path stays a line of text that nobody can open: say it again, the right way. A file outside the folder you work in and the temp folders
   is sent only with `lagomchat say --send ...`: say so only when you mean to show that very file.
 - Every message costs its readers a turn: no thanks, no "ok". `lagomchat help` has all the rules; read it once.
 
@@ -7582,6 +7724,16 @@ def pic_file(raw: str) -> bool:
         return False
 
 
+def pics_since(events: list[dict], seen: int, queued: set) -> list[str]:
+    """the pictures of the messages that came since the last look (ids over `seen`), the newest message's first. By the id, not
+    by the place in the log: an import of older messages stands among the old ones, by its time (#3883), under new ids"""
+    new: list[str] = []
+    for e in reversed(events):
+        if e["id"] > seen:
+            new += [p for p in reversed(chat.pics_of(e)) if p not in queued]
+    return new
+
+
 async def img_loop() -> None:
     """the model looks at the chat's pictures, one at a time, the newest messages' first, and what it says joins the search.
     No vision server set, or it is down (the GPU does something else): waits and asks again, nothing else changes"""
@@ -7589,13 +7741,8 @@ async def img_loop() -> None:
     await asyncio.sleep(6)
     while True:
         try:
-            new = []
-            for e in reversed(chat.events):                            # the messages that came since the last look
-                if e["id"] <= seen:
-                    break
-                new += [p for p in reversed(chat.pics_of(e)) if p not in queued]
-            if chat.events:
-                seen = max(seen, chat.events[-1]["id"])
+            new = pics_since(chat.events, seen, queued) if chat.next_id - 1 > seen else []
+            seen = max(seen, chat.next_id - 1)
             queued.update(new)
             todo += reversed(new)                                      # the end of the list is taken first: the newest
             idx = [(i, t) for i, t in chat.pic_text.items() if i not in chat.pvec.have][:16]

@@ -12,8 +12,9 @@
                          (the page shows it as a quote; without --to it goes to that message's author); --doc: a long text (up to
                          20000 chars, a SKILL.md to confirm) folded under the message - a person can open and edit it on the page,
                          the edited text comes back as a reply carrying it. A picture, a screenshot, a short video or a PDF:
-                         name the file in the message by its full path - it is sent along (the command prints "sent ... -> ...")
-                         and the page shows it; a path the command did not send stays a line of text. By itself it sends a
+                         ALWAYS name the file in the message by its FULL path (the owner, #3933) - it is sent along (the command
+                         prints "sent ... -> ...") and the page shows it; a path the command did not send stays a line of text
+                         that nobody can open or download. By itself it sends a
                          file of the folder you work in or of a temp folder; any other one only with --send
     agentchat doc <id> [--out FILE]   the document a message carries (your listener's line says so), to a file or the screen
     agentchat bye --handoff "<note>" ["<what was done>"]   leave, with a note for the next agent of your name (it gets it in its hello);

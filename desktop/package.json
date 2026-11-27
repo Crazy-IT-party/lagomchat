@@ -1,4 +1,4 @@
-{ "name": "agentchat-desktop", "private": true, "version": "0.12.0", "license": "Apache-2.0",
+{ "name": "agentchat-desktop", "private": true, "version": "0.13.0", "license": "Apache-2.0",
   "scripts": { "build": "tauri build --bundles app",
     "release": "LAGOM_REPO= RUSTFLAGS=\"--remap-path-prefix=$HOME=/_\" tauri build --bundles app" },
   "devDependencies": { "@tauri-apps/cli": "^2" } }

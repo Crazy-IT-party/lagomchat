@@ -3,7 +3,7 @@ name: agents-chat-release
 description: >
   Release LagomChat (this repo) as version X.Y.Z: a full audit of the code since the last release - DRY, KISS, the repo's own
   patterns and best practices, consistency with the code around it - a security audit, a scan for leaked personal data, unused
-  files and code; the findings fixed and tested, then the version committed, the public GitHub repo updated, a GitHub release
+  files and code, the README and the other docs brought up to date; the findings fixed and tested, then the version committed, the public GitHub repo updated, a GitHub release
   with the Mac (signed, notarized) and Linux apps, and the iPhone / iPad app sent to TestFlight. Use when the owner says
   "/agents-chat-release 0.12.0", "сделай релиз 0.12.0", "выпусти версию", "релизни", "release 0.12.0", "ship a new version".
   The push, the publication and the upload each need the owner's confirmation (terminal, or `agentchat confirm`).
@@ -47,6 +47,17 @@ Say in the chat what you do at each step: `agentchat working "release V: <step>"
 - **Unused**: `python3 H/unused.py` (about 30 s): candidates only - check each (a handler registered by name, an attribute in
   a template, a key built at run time); remove what is really dead, with the code that only it used.
 
+- **The docs up to date** (the owner, #3944): no release with a README or another doc that tells of an older LagomChat. Go
+  through `git log PREV..HEAD --oneline` and, for every change a reader would meet - a feature added, changed or taken away,
+  a command, a setting, a file, a port, a way to install, run or sign in - see that these say what the code does now:
+  `README.md` (Key features, Files, Running, Sign-in, Reaching a chat from the internet, Agents, The app; a new thing of
+  the release is in Key features), `RULES.md` (= `agentchat help`) with the help text at the top of `agentchat.py` and the
+  `/join` text of `server.py` (`_join_text`) - the three say the same -, every `skills/*/SKILL.md` whose commands, files or
+  steps changed (this one too), the landing page `site/index.html`, `TODO.md` (what is done goes out of it). Check what a doc
+  claims against the code, not against the commit message: a command it names runs (`--help`, a dry run), a file it names is
+  there, a number (port, limit, version of a tool) is the code's. A doc that needs nothing: say so in the report, by name.
+  A `server.py` text changed (`/join`) is live only after the chats restart: tell the owner.
+
 Write the findings down (file:line, what, why it matters), most serious first. Then fix them: small commits, one subject each
 ("Audit before V: ..."), each with a test that fails before and passes after where it can (`unit` checks for server.py,
 headless Chrome for the page - a throwaway chat with its own HOME, conf and data on a free port, never the live chats). A finding
@@ -55,7 +66,7 @@ that is not clear-cut (a behaviour the owner may want) is not fixed: list it for
 ## 2. The owner's go
 
 Post the report in the chat in the asker's language: what the audit found and fixed (counts and the main points, commits),
-what was left for him, the tests run. Then `agentchat confirm "Release V: version commit, public repo snapshot + tag + GitHub
+which docs were brought up to date and which needed nothing, what was left for him, the tests run. Then `agentchat confirm "Release V: version commit, public repo snapshot + tag + GitHub
 release with Mac/Linux apps, TestFlight upload"`; go on only when `agentchat confirmed <id>` prints yes (or he says so in the
 terminal). A typed yes or an `ask` pick is not a confirmation.
 
