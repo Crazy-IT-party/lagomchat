@@ -24,6 +24,12 @@
   .bar.v { width: 8px; margin-left: -4px; cursor: col-resize; }
   .bar.h { height: 8px; margin-top: -4px; cursor: row-resize; }
   .bar:hover, .bar.on { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+  /* a pane whose chat did not open (the owner, #3959): said over its frame, with the way out */
+  .pane .need { position: absolute; inset: 27px 0 0; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 16px; text-align: center; background: var(--bg); color: var(--muted); font-size: 14px; line-height: 1.4; }
+  .pane .need b { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+  .pane .need div { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+  .pane .need button { height: 30px; padding: 0 14px; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+  .pane .need button.go { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   body.drag iframe { pointer-events: none; }        /* a divider dragged over a frame: the frame does not take the pointer away */
 </style>
 </head>
@@ -56,12 +62,13 @@ const ok = u => { try { const x = new URL(u, location.href), h = x.hostname;
   return /^https?:$/.test(x.protocol) && (h === location.hostname || h === SITE || h.endsWith('.' + SITE)) ? x.href : null; } catch { return null; } };
 const good = n => !!n && typeof n === 'object' && (typeof n.u === 'string' || (n.d && good(n.a) && good(n.b)));   // a whole tree, or none
 function read() {
-  try { const t = JSON.parse(decodeURIComponent(location.hash.slice(1))); if (good(t)) return t; } catch { /* */ }
+  // `?l=`: the layout brought over from another chat's split page, through that chat's sign-in (see needs); save() puts it into the hash
+  try { const t = JSON.parse(new URLSearchParams(location.search).get('l') || decodeURIComponent(location.hash.slice(1))); if (good(t)) return t; } catch { /* */ }
   return { u: new URL('./', location.href).href };
 }
+const layout = () => { const out = n => n.p ? { u: panes.get(n.p).u } : { d: n.d, f: Math.round(n.f * 1000) / 1000, a: out(n.a), b: out(n.b) }; return JSON.stringify(out(tree)); };
 function save() {
-  const out = n => n.p ? { u: panes.get(n.p).u } : { d: n.d, f: Math.round(n.f * 1000) / 1000, a: out(n.a), b: out(n.b) };
-  history.replaceState(null, '', '#' + encodeURIComponent(JSON.stringify(out(tree))));
+  history.replaceState(null, '', location.pathname + '#' + encodeURIComponent(layout()));
   const ts = [...panes.values()].map(p => p.t).filter(Boolean);
   document.title = ts.length ? ts.join(' | ') : 'LagomChat';
 }
@@ -71,10 +78,50 @@ function pane(u) {
   el.innerHTML = `<header><b></b>${['v', 'h', 'one', 'x'].map(k => `<button type="button" data-a="${k}" title="${L[k]}" aria-label="${L[k]}">${ico(k)}</button>`).join('')}</header>`;
   const src = ok(u) || new URL('./', location.href).href, o = new URL(src).origin;
   fr.allow = allowFor(o); fr.src = src;
-  fr.addEventListener('load', () => el.classList.remove('own'));   // a page loaded anew says again whether it has the bar
+  fr.addEventListener('load', () => { el.classList.remove('own'); watch(id, 2500); });   // a page loaded anew says again whether it has the bar
   el.append(fr); box.append(el);
-  panes.set(id, { el, fr, u: src, t: '', o });
+  panes.set(id, { el, fr, u: src, t: '', o, at: -1e9 });   // at: when its page spoke last
+  watch(id, 12000);                                  // a frame refused may say nothing of it, not even that it loaded
+  signedIn(src).then(y => { if (!y) needs(id); });   // a layout that came back after its chats' sign-ins ran out
   return { p: id };
+}
+// a pane whose chat does not open (the owner, #3959: in the app some chats did not). A chat's page in a pane says so the moment
+// it runs (lc: here, bar). A frame that stays silent holds something else: most often the sign-in page of a chat this browser
+// is not signed in to, or whose sign-in ran out - such a page refuses to be shown in a frame (Cloudflare Access: frame-ancestors
+// 'none'), so the pane stayed empty with no word of why. It is said over the frame, with two ways out: the same window on that
+// chat's own split page, where its sign-in is the window's own page and can be shown - the layout goes along in the address and
+// comes back as it was - or the frame once more
+// is this browser signed in to the chat at `u`? Its icon is asked for as a picture: a chat behind a sign-in of its site
+// (Cloudflare Access) answers anything with its sign-in page, which is no picture. (A request by fetch tells nothing here: the
+// answer of another origin, redirect or not, is kept from this page.) No answer in 6 s: left to the frame
+const signedIn = u => new Promise(res => {
+  const im = new Image(), t = setTimeout(() => res(true), 6000), say = y => () => { clearTimeout(t); res(y); };
+  im.onload = say(true); im.onerror = say(false); im.src = new URL('appicon-192.png', u).href + '?' + Date.now();
+});
+// another chat picked in a pane (its page asks: lc go): the pane is that chat's from now on, shown if it will show
+async function go(id, u) {
+  const p = panes.get(id); if (!p || !(u = ok(u))) return;
+  p.u = u; p.o = new URL(u).origin; p.t = ''; p.el.querySelector('header b').textContent = new URL(u).host; save();
+  if (!await signedIn(u)) { p.fr.src = 'about:blank'; return needs(id); }   // the chat left goes: it would say the pane is its own still
+  p.el.querySelector('.need')?.remove(); p.fr.allow = allowFor(p.o); p.fr.src = u; watch(id, 12000);
+}
+function watch(id, ms) {
+  const from = performance.now();
+  setTimeout(() => { const p = panes.get(id); if (p && p.at < from - 1500) needs(id); }, ms);
+}
+function needs(id) {
+  const p = panes.get(id); if (!p) return;
+  p.el.querySelector('.need')?.remove();             // one of another chat, left a moment ago
+  const n = document.createElement('div'); n.className = 'need';
+  p.el.classList.remove('own');                      // the pane's own header back: its Close is the third way out
+  n.innerHTML = `<span><b></b><br>This chat did not open here. It may need a sign-in.</span><div><button type="button" class="go" data-n="in">Sign in</button><button type="button" data-n="again">Try again</button></div>`;
+  n.querySelector('b').textContent = new URL(p.u).host;
+  n.addEventListener('click', e => {
+    const a = e.target.closest('[data-n]')?.dataset.n; if (!a) return;
+    if (a === 'in') location.href = new URL('split', p.u).href + '?l=' + encodeURIComponent(layout());
+    else { n.remove(); go(id, p.u); }
+  });
+  p.el.append(n);
 }
 function grow(n) { return n.u !== undefined ? pane(n.u) : { d: n.d === 'h' ? 'h' : 'v', f: Math.min(.9, Math.max(.1, +n.f || .5)), a: grow(n.a), b: grow(n.b) }; }
 // where everything goes: each pane's box in percent of the window, a divider at each split
@@ -118,8 +165,10 @@ const byWin = w => [...panes.entries()].find(([, p]) => p.fr.contentWindow === w
 addEventListener('message', e => {
   const hit = byWin(e.source), d = e.data; if (!hit || !d || typeof d !== 'object') return;
   const [id, p] = hit;
+  p.at = performance.now(); p.el.querySelector('.need')?.remove();   // its page runs: the chat is open
   if (d.lc === 'here') { const u = ok(d.u); if (u) p.u = u; p.el.classList.toggle('own', !!d.bar);
     if (u && new URL(u).origin !== p.o) { p.o = new URL(u).origin; p.fr.allow = allowFor(p.o); p.fr.src = u; } p.t = String(d.t || '').slice(0, 120); p.el.querySelector('header b').textContent = p.t; save(); }
+  else if (d.lc === 'go') { e.source.postMessage({ lc: 'going' }, e.origin); go(id, d.u); }   // the answer: its page need not go by itself
   else if (d.lc === 'split') split(id, d.d === 'h' ? 'h' : 'v');
   else if (d.lc === 'focus') { act = id; place(); }
   else if (d.lc === 'bar') p.el.classList.add('own');

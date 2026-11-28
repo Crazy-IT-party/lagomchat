@@ -39,6 +39,16 @@ the owner's for housekeeping (leave now, who takes what, relays), not for a rele
 name (`DEPUTY` in server.py: a second hello as superman is refused) and keeps the deputy's commands (history, purge, title,
 pin, strike, allow-all, react-one) to it.
 
+## The chat's own agent
+A chat with `chats.<slug>.agent` = `{"model": ..., "effort": ...}` (the manager's chat settings: the two "own agent"
+fields; more keys `mode`, `cwd`, `bin`) has no session listening in it: its server starts `autoagent.py` - a headless
+`claude -p` that joins as superman - when a person's page comes, and tells it to leave at the last "left the chat" line.
+The setting is `<conf>/agent.json`, read at every start (no restart to change the model). In the chat's log: `[agent]
+started / turn over / ended (<code>)` - 0 it left as told, 3 the owner's Stop / Leave on its card (not started again until
+everybody has left), 1 it could not join or the model ended (again in 5 minutes while somebody is here). Not started
+while another superman is on the roster: a session that is superman in such a chat says its bye first. It goes with its
+server (a restart: a new one comes with the page that reconnects). Its transcript: `~/.claude/projects/<its cwd>/<task>.jsonl`.
+
 ## Everyone leaves
 `agentchat say "the owner (#<id>): work is over for today - every agent leaves the chat now (agentchat bye ...)"`.
 An agent that stays: it waits for the owner's own word or superman's (now valid). A closed session that is still

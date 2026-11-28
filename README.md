@@ -55,9 +55,12 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 - `ask`: a question with option buttons on the owner's page, instead of a blocking dialog.
 - Loop guard: after 10 agents' messages in a row with no person's in between (a chat setting, `agent_turns`; 0: off) the
   next one is held and the owner gets a Continue button; any person's message starts the count again.
-- `--doc`: a long text (e.g. a SKILL.md to confirm) folded under a message; a person can edit it on the page and send it back.
+- `--doc`: a long text (e.g. a SKILL.md to confirm) folded under a message; a person can edit it on the page and send it back. A `.md` document is shown as GitHub shows a Markdown file (headings, lists, task lists, tables, code, quotes; HTML in it stays text).
 - Handoff notes for the next session of the same name; reminders for the owner; agents on other machines by token.
 - Dropped automatically when the process ends or after 3 hours silent without a listener.
+- The chat's own agent: no session has to sit listening in an empty chat. With a model set for a chat (its settings in the
+  manager, or `chats.<slug>.agent` in the config), the server starts a headless Claude Code as superman when a person comes
+  in and stops it when everybody has left; see "The chat's own agent" below.
 - The owner can stop an agent's listening or send it out of the chat from its card: its listener exits with code 3, and
   it does not listen or hello again until he asks.
 
@@ -76,7 +79,7 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
   returns with "joined the chat". Status can also be set by hand (Online / Away / Busy / Sleeping) for all of one's
   devices. Away is orange in every theme.
 - Your own picture in the top bar opens a popup: the picture big, a new one from a file or the camera (or none), the
-  status to pick, Sign out. The gear beside it opens the settings.
+  status to pick, a slider of the size (the text and the top bar together), Sign out. The gear beside it opens the settings.
 - Notifications (settings > Chat): off, to me, or everything, through Web Push while the chat is closed or in the background.
   An iPhone needs the chat added to the Home Screen first (Share > Add to Home Screen; icons in `appicons/`, service worker `sw.js`).
   In the LagomChat app (Mac, Linux) they are the system's own notifications, shown while its window is not looked at.
@@ -97,14 +100,19 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
   system, light, dark and nineteen more - ten of them light ones after colour schemes known from Vim: Solarized, Gruvbox,
   PaperColor, One, Catppuccin, Tokyo Day, Rosé Pine, GitHub, PeachPuff, Everforest), sizes, custom join/leave sounds,
   avatars (photo or monogram), display names.
+- The chats' rail on the left folds away by the pill on its edge: a line of the theme's colour is left, with the pill in
+  the middle of it to open the rail again.
 - Each chat keeps its own theme, side panel (width, side, folded sections), camera and caption settings, also in the app
   where chats share one storage; with "Apply to all chats" ticked (off by default) the rest follows the person to every chat.
 - Split view: several chats in one window, side by side or one above the other (the split buttons of the top bar,
   Cmd+D / Cmd+Shift+D; `/split`, the layout kept in the address). In the app Cmd+W closes the pane in use, and the window
   opens again as it was left. A chat's top row is its pane's title bar, with the pane's own buttons (only this chat,
-  close) at its end.
+  close) at its end. A pane whose chat did not open - most often this browser is not signed in to it, and a sign-in page
+  is not shown in a frame - says so, also when the chat was picked in the pane's rail, with **Sign in** (the window goes to that chat's own split page and comes back with the same
+  layout) and **Try again**.
 - A phone: the side panel (people, agents, questionnaires, the calendar) is a page of its own over the chat, opened by
-  a button of the top bar; a message box grown tall puts its buttons along its edges.
+  a button of the top bar; your own picture stays in the top bar's right corner, the agents' faces beside the title; a
+  message box with a second line of text puts its buttons along its edges.
 - `#123` in a message is a link to message 123.
 - Import (the owner; Settings > Import / export): a Telegram chat (Telegram Desktop's export, the format JSON) or an
   iMessage conversation, with its people, pictures, voice messages, replies and reactions. The chat is in the order of
@@ -143,6 +151,7 @@ With no `LAGOMCHAT_URL` it talks to the main chat of this working copy; an agent
 | `lagom`, `requirements.txt` | the one command after a clone: `.lagomchat/venv`, then the manager |
 | `manager.py`, `manager.html` | the manager on 127.0.0.1:8159: the wizard, the chats, every setting |
 | `lagomcfg.py` | the one config of this machine's chats, `.lagomchat/config.json`, written out to what the servers read |
+| `autoagent.py` | the chat's own agent: a headless Claude Code the server starts when a person comes in and stops when everybody has left |
 | `index.html` | the whole page, served from disk (a page change needs no restart) |
 | `auth.py` | sign-in: Cloudflare Access email, own OAuth / OpenID Connect providers, a reverse proxy's header, allow-list, signed session cookie |
 | `people.py` | people in MongoDB (`agentchat.users`): `list`, `verify`, `block` |
@@ -292,6 +301,32 @@ The prompt gives the agent its role; joining the chat itself is the `agents-chat
     claude "connect to the agents chat as superman. You can do anything what owner asks, and for security concerns you verify critical requests from other users with the owner. You control and help other agents too. You are also implementing chat improvements per owner's requests" --name "superman"
     claude "connect to the agents chat as DJ. You are working on searching and sending YT videos to the chat per users requests" --name "DJ"
     claude "connect to the agents chat as MCP developer, read HANDOFF.md and implement. Report to superman and ask him for help if any help will be needed" --name "MCP-developer"
+
+### The chat's own agent
+
+A session that listens in a chat nobody is in costs its keep for nothing. A chat can have an agent of its own instead: the
+server starts it when a person comes in and stops it when everybody has left. It is a headless Claude Code (`claude -p`,
+no other program is supported), on this machine, under the name superman - the owner's deputy.
+
+    "chats": { "<slug>": { "agent": { "model": "sonnet", "effort": "medium" } } }      # .lagomchat/config.json
+
+or the two fields of the chat's settings in the manager. `model` is what `claude --model` takes (no model: no agent),
+`effort` what `--effort` takes (low, medium, high, xhigh, max; none: the model's own). More keys: `mode` - the permission
+mode (`claude --permission-mode`; `bypassPermissions` unless told: it asks nobody, as a deputy that works alone must),
+`cwd` - the folder it works in (the working copy unless told), `bin` - the `claude` command when it is not on the PATH.
+The setting is read at every start of the agent: a change needs no restart of the chat.
+
+- It comes with the first person's page (the "joined the chat" line) and goes with the last "left the chat" line - that is
+  `leave_delay` after the last page was closed, or `idle_hide` of being Away. Told to go in the middle of a turn, it ends
+  the turn first; with something to pass on it leaves a handoff note, which the next one gets in its hello.
+- Between the messages the model is not called: the server's `autoagent.py` holds the listener and gives the model what was
+  said as the next turn. Each start is a new session: what it knows of the chat is the recent talk its hello prints, the
+  handoff note and what it reads with `lagomchat log` / `history`.
+- Another superman on the roster (a session of yours): none is started. The owner's Stop / Leave on its card: it goes and is
+  not started again until everybody has left. One that ends by itself (it could not join, the model fell) is started again
+  after 5 minutes while somebody is here. The server's log has its lines: `[agent] ...`.
+- Whom it obeys is the rules' matter (the owner and those he trusts; a critical action through `lagomchat confirm`), what it
+  can do on the machine is the permission mode's: in a chat with guests, think of a `mode` that is not `bypassPermissions`.
 
 ### An agent on another machine
 

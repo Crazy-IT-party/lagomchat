@@ -51,6 +51,9 @@ CONF_FILES = {
     "telegram_token": ("telegram_bot.token", "line"),
     "guests": ("allow.json", "json"),
     "signin": ("signin.json", "secret-json"),          # the sign-in mode and its providers (auth.py); none: the file is not there
+    # the chat's own agent (the owner, #4001): {model, effort, mode, cwd, bin} - a headless Claude Code the server starts when
+    # a person comes in and stops when everybody has left (autoagent.py); no model: none, the file is not there
+    "agent": ("agent.json", "secret-json"),
 }
 # a chat's settings given to its server in the environment
 ENV = {"cf_aud": "LAGOMCHAT_CF_AUD", "embed_url": "LAGOMCHAT_EMBED_URL", "leave_delay": "LAGOMCHAT_LEAVE_DELAY",
@@ -59,7 +62,7 @@ ENV = {"cf_aud": "LAGOMCHAT_CF_AUD", "embed_url": "LAGOMCHAT_EMBED_URL", "leave_
 CHAT_DEFAULTS = {"title": "", "host": "", "port": 0, "main": False, "auth": False, "owner_email": "", "reserved_names": [],
                  "score_rival": "", "owner_steam": "", "giphy_token": "", "telegram_token": "",
                  "guests": {"google_domains": [], "google_emails": [], "discord_ids": []},
-                 "signin": {},
+                 "signin": {}, "agent": {},
                  "via": "",                              # how the chat is reached: '' (by its address: this machine, or Cloudflare) / ngrok / caddy
                  "ngrok_oauth": "",                      # an ngrok chat whose sign-in is ngrok's: the provider there (none: google)
                  "cf_aud": "", "embed_url": "", "leave_delay": 1800, "people_quiet": 30, "idle_hide": 1800,
@@ -102,7 +105,8 @@ def normal(c: dict) -> dict:
         out[k] = {**DEFAULTS[k], **(c.get(k) or {})}
     out["chats"] = {s: {**json.loads(json.dumps(CHAT_DEFAULTS)), **v} for s, v in (c.get("chats") or {}).items()}
     for ch in out["chats"].values():
-        ch["signin"] = pruned(ch.get("signin")) if isinstance(ch.get("signin"), dict) else {}
+        for k in ("signin", "agent"):
+            ch[k] = pruned(ch.get(k)) if isinstance(ch.get(k), dict) else {}
     return out
 
 
@@ -436,7 +440,8 @@ def create_remote(c: dict, title: str, slug: str, how: str, host: str) -> dict:
     return {**_create(c, title, slug or ("" if title.strip() else host.split(".")[0]), host=host, via=how, auth=True, signin=signin), "via": how}
 
 
-SERVER_CODE_NOT = {"manager.py", "chats.py", "lagomcfg.py", "people.py"}     # the rest of the working copy's .py is a chat server's code
+# the rest of the working copy's .py is a chat server's code (autoagent.py is run anew at every start of a chat's own agent)
+SERVER_CODE_NOT = {"manager.py", "chats.py", "lagomcfg.py", "people.py", "autoagent.py"}
 
 
 def code_time() -> float:

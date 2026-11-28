@@ -51,6 +51,7 @@ import urllib.parse
 import sys
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -81,6 +82,7 @@ PEOPLE_QUIET = float(os.environ.get("LAGOMCHAT_PEOPLE_QUIET", "30"))
 # agents talking among themselves: after this many of their messages in a row with no person's in between, the next one
 # is held and the owner gets a Continue button; any person's message starts the count again; 0: no limit (the owner, #2285)
 AGENT_TURNS = max(0, int(os.environ.get("LAGOMCHAT_AGENT_TURNS", "10") or 0))
+AGENT_AGAIN = 300          # the chat's own agent that ended by itself (it could not join, its model fell) is started again after this long, not in a loop
 PEOPLE_IDLE_HIDE = float(os.environ.get("LAGOMCHAT_IDLE_HIDE", "1800"))   # Away for this long more -> "left the chat", the card hidden (the owner, #1550)
 DATA = Path(os.environ.get("LAGOMCHAT_DATA", Path.home() / ".local/share/agentchat"))
 HOST = socket.gethostname()
@@ -164,6 +166,11 @@ class Chat:
         self.leaving: dict = {}                    # a person's task -> the timer of their "left" line
         self.idle_timers: dict = {}                # a person's task -> the timer that hides them after Away (#1550)
         self.away_gone: dict = {}                  # a person's task -> name: left the chat by idleness, the card hidden until back
+        self.own = None                            # the chat's own agent (#4001): the process of autoagent.py while it runs
+        self.own_task = ""                         # ... its task code (the session's id, given to it)
+        self.own_wait = 0.0                        # ... not started before this time (AGENT_AGAIN after one that ended by itself)
+        self.own_word = ""                         # ... what it was last told: stay / leave
+        self.own_out = False                       # ... the owner stopped it or sent it out: not started again until everybody has left
         self.started = time.time()
         self.peers: dict = {}                      # a page's peer id -> its socket (the video's signalling, #1388)
         self.mine_up: dict = {}                    # a page's task -> the files it uploaded (its own attachments' thumbnails)
@@ -1442,11 +1449,63 @@ class Chat:
         if job:
             job.cancel()
         if t in self.people_on:
-            return
-        if time.time() - self.started < PEOPLE_QUIET:    # the pages coming back after a restart, the first one with this code among them
+            pass
+        elif time.time() - self.started < PEOPLE_QUIET:  # the pages coming back after a restart, the first one with this code among them
             self.people_on[t] = me["name"]
+        else:
+            await self.post("pjoin", {"name": me["name"], "task": t}, "joined the chat")
+        self.own_sync()
+
+    # the chat's own agent (the owner, #4001): no session sits listening in an empty chat - a headless Claude Code (autoagent.py)
+    # is started as superman when a person is here and told to leave when the log says everybody has left ("left the chat":
+    # PEOPLE_LEAVE_DELAY after the last page went, or hidden by idleness). Set per chat: <conf>/agent.json, written from
+    # chats.<slug>.agent of the config - {model, effort, mode, cwd, bin}, read at every start (a change needs no restart); no
+    # model there = no agent. Another superman on the roster (a session of the owner's): none is started.
+    def own_sync(self) -> None:
+        p = self.own if self.own and self.own.returncode is None else None
+        if not self.people_on:
+            self.own_out = False
+            self.own_tell(p, "leave")                  # it goes when the turn it is in is over
             return
-        await self.post("pjoin", {"name": me["name"], "task": t}, "joined the chat")
+        if p:
+            self.own_tell(p, "stay")                   # somebody came back before it went
+            return
+        if self.own_out or time.time() < self.own_wait or not any(self.person_here(t) for t in self.people_on) \
+                or any(a["name"].lower() in DEPUTY for a in self.agents.values()):
+            return
+        try:
+            c = json.loads((auth.CONF / "agent.json").read_text())
+        except (OSError, ValueError):
+            return
+        if isinstance(c, dict) and c.get("model"):
+            self.own_wait = time.time() + AGENT_AGAIN
+            asyncio.ensure_future(self.own_run(c))
+
+    def own_tell(self, p, word: str) -> None:
+        if p and self.own_word != word:
+            self.own_word = word
+            with contextlib.suppress(OSError, RuntimeError):
+                p.stdin.write(f"{word}\n".encode())
+
+    async def own_run(self, c: dict) -> None:
+        self.own_task = str(uuid.uuid4())
+        argv = [sys.executable, str(HERE / "autoagent.py"), "--url", f"ws://127.0.0.1:{PORT}", "--session", self.own_task,
+                "--model", str(c["model"]), "--cwd", str(c.get("cwd") or HERE)]   # in the working copy unless told: where the owner's sessions work
+        for k in ("effort", "mode", "bin"):
+            if c.get(k):
+                argv += [f"--{k}", str(c[k])]
+        try:
+            self.own = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.PIPE)
+        except OSError as x:
+            print(f"[agent] not started: {x}", flush=True)
+            return
+        self.own_word = "stay"
+        print(f"[agent] started ({self.own.pid}): {' '.join(argv[6:])}", flush=True)
+        code = await self.own.wait()
+        if code == 0 or self.own_out:                    # it left as told, or by the owner's word: the next time one comes at once
+            self.own_wait = 0.0
+        print(f"[agent] ended ({code})", flush=True)
+        self.own_sync()                                  # people still here: another one, when it may
 
     def idle_changed(self, me: dict) -> None:
         """a tab's status changed: Away (auto) starts the clock; back cancels it (#1550)"""
@@ -1516,6 +1575,8 @@ class Chat:
         await self.fanout(e)
         if kind in ("msg", "remind") and PUSH.subs and not e.get("cc"):
             asyncio.create_task(push_out(self, e))           # Web Push to the people whose pages are closed (the owner, #1445)
+        if kind == "pleft":
+            self.own_sync()                                    # the last one went: the chat's own agent goes too (#4001)
         if kind == "msg" and a["task"] not in self.agents:
             self.agent_run, self.agent_paused = 0, False         # a person spoke: the agents' count starts again (#2285)
         if kind == "msg" and a["task"] == "user":
@@ -1791,6 +1852,8 @@ class Chat:
         lines = {"stop": "[agentchat] the owner stopped your listening from the page: do not start `agentchat listen` again until he asks you to",
                  "leave": "[agentchat] the owner sent you out of the chat from the page: you are off the roster; do not hello or listen again until he asks you to"}
         print(f"[agent_ctl] {act} {a['name']} ({a['task'][:8]})", flush=True)
+        if a["task"] == self.own_task:
+            self.own_out = True                    # the chat's own agent: it goes, and is not started again until everybody has left (#4001)
         if act == "leave":
             await self.post("bye", a, "sent out of the chat by the owner")
         for w in list(self.listeners.pop(a["task"], ()) if act == "leave" else self.listeners.get(a["task"], ())):
@@ -1804,6 +1867,7 @@ class Chat:
         while True:
             await asyncio.sleep(15)
             self.here_touch()
+            self.own_sync()                      # the chat's own agent ended by itself, or the other superman left: another one
             now = time.time()
             for a in list(self.agents.values()):
                 why = None
@@ -7848,6 +7912,8 @@ async def on_stop(app):
         except Exception:
             pass
     await asyncio.gather(*(bye(w) for w in socks))
+    if chat.own and chat.own.returncode is None:
+        chat.own.terminate()                       # the chat's own agent goes with its server (it says its bye by itself)
 
 
 class _Stamped:

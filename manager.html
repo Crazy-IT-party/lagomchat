@@ -37,6 +37,8 @@
   #list .chat .top .dot { margin-top: 6px; }
   #list .chat .nm { min-width: 0; overflow-wrap: anywhere; }
   #list .chat .stale { display: block; margin: 2px 0 0; white-space: normal; }
+  #list .chat .own { display: flex; align-items: center; gap: 5px; margin: 3px 0 0; color: var(--accent); font-size: 12px; }
+  #list .chat .own svg { width: 14px; height: 14px; flex: none; }
   #list .chat .row { margin-top: auto; gap: 6px; }
   #list .chat .row button { padding: 5px 9px; font-size: 13px; }
   h1 { font-size: 22px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
@@ -158,6 +160,7 @@ const I = {
   open: '<path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
   play: '<path d="M7 5l12 7-12 7z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
   re: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', ok: '<path d="M5 12l5 5L20 7"/>',
+  bot: '<rect x="5" y="9" width="14" height="10" rx="2"/><path d="M12 9V5M9.5 14v1M14.5 14v1"/><circle cx="12" cy="4" r="1"/>',
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>', del: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
 };
 const ico = n => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${I[n]}</svg>`;
@@ -192,11 +195,13 @@ async function load(keepForm) {
 }
 function paintList() {
   const stale = S.chats.filter(c => c.stale);
+  // a chat with an agent of its own says so on its card: the model and the effort (the owner, #4026)
+  const own = c => { const a = S.config.chats[c.slug]?.agent || {}; return a.model ? `<span class="own" title="The chat's own agent: started as superman when a person comes in, stopped when everybody has left">${ico('bot')}${esc(a.model)}${a.effort ? ' · ' + esc(a.effort) : ''}</span>` : ''; };
   $('#staleBtn').hidden = !stale.length;
   $('#staleBtn').innerHTML = `${ico('re')}Restart the ${stale.length} with older code`;
   $('#list').innerHTML = S.chats.map(c => `<div class="chat${c.stale ? ' is-stale' : ''}" data-slug="${esc(c.slug)}">
     <div class="top"><span class="dot${c.running ? ' on' : ''}" title="${c.running ? 'running' : 'stopped'}"></span>
-    <div class="nm"><b>${esc(c.title)}${c.main ? ' <span class="hint">main</span>' : ''}</b><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url.replace(/^https?:\/\//, ''))}</a> <span class="hint">:${c.port}${VIA[c.via] ? ' · ' + VIA[c.via] : ''}</span>${c.stale ? '<span class="stale" title="The server\'s code changed after this chat started: it runs the older code until it restarts">needs a restart: the code changed</span>' : ''}</div><button type="button" class="gear" data-cfg title="Settings" aria-label="Settings">${ico('gear')}</button></div>
+    <div class="nm"><b>${esc(c.title)}${c.main ? ' <span class="hint">main</span>' : ''}</b><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url.replace(/^https?:\/\//, ''))}</a> <span class="hint">:${c.port}${VIA[c.via] ? ' · ' + VIA[c.via] : ''}</span>${c.stale ? '<span class="stale" title="The server\'s code changed after this chat started: it runs the older code until it restarts">needs a restart: the code changed</span>' : ''}${own(c)}</div><button type="button" class="gear" data-cfg title="Settings" aria-label="Settings">${ico('gear')}</button></div>
     <div class="row">
       ${c.running ? `<a href="${esc(c.url)}" target="_blank" rel="noopener"><button type="button">${ico('open')}Open</button></a>
         <button type="button" data-op="restart">${ico('re')}Restart</button><button type="button" data-op="stop">${ico('stop')}Stop</button>`
@@ -312,6 +317,9 @@ function chatForm(slug) {
       ${F(p + 'pq', 'People quiet (s)', ch.people_quiet, { k: k('people_quiet'), t: 'num', type: 'number' })}
       ${F(p + 'ih', 'Away hidden after (s)', ch.idle_hide, { k: k('idle_hide'), t: 'num', type: 'number' })}
       ${F(p + 'at', 'Agents in a row before a pause (0: never)', ch.agent_turns ?? 10, { k: k('agent_turns'), t: 'num', type: 'number' })}
+      ${F(p + 'agm', "The chat's own agent: model", (ch.agent || {}).model || '', { k: k('agent.model'), ph: 'none: no agent', hint: 'a headless Claude Code, started as superman when a person comes in, stopped when everybody has left' })}
+      <div><label for="${p}age">The chat's own agent: effort</label><select id="${p}age" data-k="${esc(k('agent.effort'))}" data-t="str">
+        ${['', 'low', 'medium', 'high', 'xhigh', 'max'].map(v => `<option value="${v}"${((ch.agent || {}).effort || '') === v ? ' selected' : ''}>${v || "the model's own"}</option>`).join('')}</select></div>
       ${F(p + 'py', 'Python', ch.python || '', { k: k('python'), ph: 'the manager\'s own' })}
     </div><div class="hint">conf ${esc(ch.conf)} · data ${esc(ch.data)}</div>`;
 }
